@@ -769,8 +769,25 @@ def forward_block_mn(
     # NB: For headdim=256, it's faster to move it back down to after m_i =
     # m_ij
     l_i = l_i * alpha + tl.sum(p, 1)
-    # # -- scale and update acc --
+    # -- scale and update acc --
+    # pred = tl.inline_asm_elementwise(
+    #   asm=(""
+    #   "{"
+    #   ".reg .pred p;"
+    #   "setp.eq.ftz.f32 p, $1, 0f3F800000;"
+    #   "vote.sync.all.pred $0, p, 0fFFFFFFFF;"
+    #   "}"),
+    #   constraints="=b,r",
+    #   dtype=tl.int1,
+    #   args=(alpha,),
+    #   is_pure=True,
+    #   pack=1,
+    # )
+    # if not pred:
+    # if tl.sum(alpha == 1.0) != BLOCK_M:
+    #     acc = acc * alpha[:, None]
     acc = acc * alpha[:, None]
+
     {%- if USE_TMA %}
     v = tl.load_tensor_descriptor(
         desc_v,
