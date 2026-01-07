@@ -171,6 +171,253 @@ def max_with_index(value, index, dim):
     return tl.reduce((value, index), dim, maximum_with_index)
 
 
+# ========== Ordered Reductions ==========
+# These functions perform reductions in a user-specified order for numerical
+# reproducibility. The order is specified as a tuple of strides that defines
+# how elements are visited during the reduction.
+#
+# Order Specification (from PR 167498):
+# ------------------------------------
+# The order tuple encodes the element visit order using strides:
+#
+# For FLAT tuple (s1, s2, ..., sn):
+#   - Produces a BINARY TREE reduction
+#   - Strides determine which elements are paired at each tree level
+#   - Example: (4, 2, 1) for 8 elements → (((0+4)+(2+6))+((1+5)+(3+7)))
+#     - Elements reordered to: 0, 4, 2, 6, 1, 5, 3, 7
+#     - Then binary tree reduction on reordered sequence
+#
+# For NESTED tuple ((inner), outer, ...):
+#   - Within nested parts: LINEAR left-to-right reduction
+#   - Example: ((2, 1), 4) for 8 elements → ((((0+2)+1)+3)+(((4+6)+5)+7))
+#     - First half [0,1,2,3] reordered by (2,1): 0,2,1,3 → linear sum
+#     - Second half [4,5,6,7] reordered by (2,1): 4,6,5,7 → linear sum
+#     - Results combined at stride 4
+#
+# The stride reordering formula:
+#   For strides (s1, s2, ..., sn) on n elements:
+#   - Position i in reordered sequence = sum of (bit_k * stride_k)
+#     where bit_k is the k-th bit of i
+
+
+@triton.jit
+def ordered_sum(value, dim):
+    """
+    Sequential sum reduction - LINEAR left-to-right in index order.
+    result = (((e[0] + e[1]) + e[2]) + ... + e[n-1])
+
+    This is the default for nested order tuples (linear within each group).
+    """
+    shape = value.shape
+    n = shape[dim]
+    result = tl.sum(value * 0.0, dim)  # zeros with correct shape
+
+    for i in tl.range(0, n):
+        idx = tl.arange(0, n)
+        mask = idx == i
+        contrib = tl.sum(tl.where(mask, value, 0.0), dim)
+        result = result + contrib
+
+    return result
+
+
+@triton.jit
+def ordered_prod(value, dim):
+    """Sequential product reduction - LINEAR left-to-right in index order."""
+    shape = value.shape
+    n = shape[dim]
+    result = tl.sum(value * 0.0, dim) + 1.0  # ones with correct shape
+
+    for i in tl.range(0, n):
+        idx = tl.arange(0, n)
+        mask = idx == i
+        elem = tl.sum(tl.where(mask, value, 1.0), dim)
+        result = result * elem
+
+    return result
+
+
+@triton.jit
+def ordered_max(value, dim):
+    """For max, order doesn't affect result mathematically."""
+    return tl.max(value, dim)
+
+
+@triton.jit
+def ordered_min(value, dim):
+    """For min, order doesn't affect result mathematically."""
+    return tl.min(value, dim)
+
+
+# ========== Hierarchical Reduction Helpers ==========
+# These Python functions compute reduction structures at compile time.
+# The actual Triton code is generated based on these structures.
+
+
+def flatten_order(order: tuple) -> list:
+    """
+    Flatten nested order tuple to sequence of strides (depth-first).
+
+    Examples:
+        (4, 2, 1) → [4, 2, 1]
+        ((4, 1), 2, 8) → [4, 1, 2, 8]
+        (((1, 2), 4), 8) → [1, 2, 4, 8]
+    """
+    result = []
+    for item in order:
+        if isinstance(item, tuple):
+            result.extend(flatten_order(item))
+        else:
+            result.append(item)
+    return result
+
+
+def is_nested_order(order: tuple) -> bool:
+    """Check if order tuple contains nested tuples."""
+    # Use explicit check instead of any() to avoid conflict with triton.jit any()
+    for item in order:
+        if isinstance(item, tuple):
+            return True
+    return False
+
+
+def compute_element_order(n: int, strides: tuple) -> list:
+    """
+    Compute element visit order from flat stride tuple using bit-interleaving.
+
+    For strides (s1, s2, ..., sk), position i maps to:
+        sum(bit[j] * strides[j] for j in range(k))
+    where bit[j] is the j-th bit of i.
+
+    Example: (4, 2, 1) for 8 elements → [0, 4, 2, 6, 1, 5, 3, 7]
+
+    This produces the reordering needed for:
+        (((0+4)+(2+6))+((1+5)+(3+7)))
+    """
+    if not strides:
+        return list(range(n))
+
+    result = []
+    num_bits = len(strides)
+    for i in range(n):
+        idx = 0
+        for bit_pos in range(num_bits):
+            if i & (1 << bit_pos):
+                idx += strides[bit_pos]
+        result.append(idx)
+    return result
+
+
+def compute_hierarchical_reduction_structure(n: int, order: tuple) -> dict:
+    """
+    Compute the full hierarchical reduction structure from an order tuple.
+
+    Returns a dict describing the reduction:
+    {
+        'type': 'tree' | 'linear' | 'hierarchical',
+        'element_order': [...],  # order to visit elements
+        'tree_structure': [...],  # for tree: pairs at each level
+        'groups': [...],  # for hierarchical: sub-reductions
+    }
+
+    Examples:
+    - (4, 2, 1) for 8 elements: tree reduction with order [0,4,2,6,1,5,3,7]
+    - ((2, 1), 4) for 8 elements: linear on [0,2,1,3], linear on [4,6,5,7], combine
+    """
+    if not is_nested_order(order):
+        # Flat tuple = tree reduction with stride reordering
+        flat_strides = list(order)
+        element_order = compute_element_order(n, tuple(flat_strides))
+        return {
+            'type': 'tree',
+            'element_order': element_order,
+            'strides': flat_strides,
+        }
+    else:
+        # Nested tuple = hierarchical with linear within groups
+        groups = []
+        outer_strides = []
+
+        # Parse the nested structure
+        # For ((inner), outer1, outer2, ...), inner defines sub-reductions
+        group_size = 1
+        for item in order:
+            if isinstance(item, tuple):
+                # Nested group - compute its structure recursively
+                inner_strides = flatten_order(item)
+                inner_n = 1 << len(inner_strides)  # 2^num_strides elements per group
+                group_size *= inner_n
+                groups.append({
+                    'strides': inner_strides,
+                    'size': inner_n,
+                    'element_order': compute_element_order(inner_n, tuple(inner_strides)),
+                })
+            else:
+                outer_strides.append(item)
+
+        num_groups = n // group_size if group_size > 0 else 1
+
+        return {
+            'type': 'hierarchical',
+            'groups': groups,
+            'outer_strides': outer_strides,
+            'group_size': group_size,
+            'num_groups': num_groups,
+        }
+
+
+def generate_linear_sum_indices(element_order: list) -> str:
+    """
+    Generate Triton code string for linear sum over reordered elements.
+
+    For element_order [0, 2, 1, 3]:
+        result = e[0]
+        result = result + e[2]
+        result = result + e[1]
+        result = result + e[3]
+    """
+    if not element_order:
+        return "0.0"
+
+    lines = [f"e[{element_order[0]}]"]
+    for idx in element_order[1:]:
+        lines.append(f"({{prev}} + e[{idx}])")
+
+    # Build nested expression
+    result = lines[0]
+    for line in lines[1:]:
+        result = line.format(prev=result)
+
+    return result
+
+
+def generate_tree_sum_expression(element_order: list) -> str:
+    """
+    Generate expression string for binary tree sum over reordered elements.
+
+    For element_order [0, 4, 2, 6, 1, 5, 3, 7]:
+        (((e[0]+e[4])+(e[2]+e[6]))+((e[1]+e[5])+(e[3]+e[7])))
+    """
+    if not element_order:
+        return "0.0"
+    if len(element_order) == 1:
+        return f"e[{element_order[0]}]"
+
+    # Build binary tree bottom-up
+    current = [f"e[{i}]" for i in element_order]
+
+    while len(current) > 1:
+        next_level = []
+        for i in range(0, len(current), 2):
+            if i + 1 < len(current):
+                next_level.append(f"({current[i]}+{current[i+1]})")
+            else:
+                next_level.append(current[i])
+        current = next_level
+
+    return current[0]
+
+
 @triton.jit
 def exp(x, use_fast_math: tl.constexpr):
     if use_fast_math:

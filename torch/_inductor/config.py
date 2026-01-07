@@ -821,6 +821,13 @@ split_reductions = os.getenv("TORCHINDUCTOR_SPLIT_REDUCTIONS", "1") == "1"
 # if we know they affect numerics.  WARNING: Expect perf hit in this mode.
 deterministic = os.getenv("TORCHINDUCTOR_DETERMINISTIC") == "1"
 
+# Maximum chunk size for ordered reduction splits.
+# When ordered reductions are split, each chunk of this size is processed
+# sequentially in-order within a kernel, then partial results are combined in-order.
+ordered_reduction_chunk_size = int(
+    os.environ.get("TORCHINDUCTOR_ORDERED_REDUCTION_CHUNK", "1024")
+)
+
 # When we do split reduction, this number control the minimum value for
 # num_split. Too small num_split make the split reduction less efficient.
 # It's a much bigger problem when we compile a dynamic shape kernel with

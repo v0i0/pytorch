@@ -114,6 +114,22 @@ class MixOrderReduction:
             and isinstance(subnode.node, ComputedBuffer)
         )
 
+    @staticmethod
+    def has_ordered_reduction(node: BaseSchedulerNode) -> bool:
+        """Check if the node contains any ordered reductions."""
+        from torch._inductor.ir import ComputedBuffer, Reduction
+
+        for subnode in node.get_nodes():
+            if not isinstance(subnode, SchedulerNode):
+                continue
+            if not subnode.is_reduction():
+                continue
+            if not isinstance(subnode.node, ComputedBuffer):
+                continue
+            if isinstance(subnode.node.data, Reduction) and subnode.node.data.ordered:
+                return True
+        return False
+
     @classmethod
     def get_numel_rnumel(cls, node: BaseSchedulerNode) -> tuple[sympy.Expr, sympy.Expr]:
         if cls.is_split_reduction(node):
@@ -235,6 +251,11 @@ class MixOrderReduction:
         Check whether we can fuse two reductions with mix loop orders.
         """
         if not config.triton.mix_order_reduction:
+            return False
+
+        # Ordered reductions cannot be fused with mix order - they must
+        # preserve their element order for numerical reproducibility
+        if cls.has_ordered_reduction(node1) or cls.has_ordered_reduction(node2):
             return False
 
         # TODO: Mix order reduction is not supported with cpp_wrapper yet
@@ -5043,6 +5064,16 @@ class Scheduler:
             return False
 
         why = WhyNoFuse(node1, node2)
+
+        # Ordered reductions have strict ordering requirements for numerical reproducibility.
+        # We conservatively prevent horizontal fusion to avoid any reordering of elements.
+        if MixOrderReduction.has_ordered_reduction(
+            node1
+        ) or MixOrderReduction.has_ordered_reduction(node2):
+            # Only allow vertical fusion (producer -> consumer) for ordered reductions
+            if not (node1.get_operation_names() & node2.ancestors):
+                why("ordered reduction cannot be horizontally fused")
+                return False
 
         if node1.is_template() and self.get_backend(
             node1.get_device()
