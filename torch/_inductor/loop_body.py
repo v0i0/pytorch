@@ -662,8 +662,25 @@ class CaptureIndexing(WrapperHandler):
         )
         return self._inner.store_reduction(name, index, value)
 
-    def reduction(self, dtype, src_dtype, reduction_type, value):
-        result = self._inner.reduction(dtype, src_dtype, reduction_type, value)
+    def reduction(
+        self,
+        dtype,
+        src_dtype,
+        reduction_type,
+        value,
+        ordered=False,
+        reduction_order=None,
+        reduction_grouping=None,
+    ):
+        result = self._inner.reduction(
+            dtype,
+            src_dtype,
+            reduction_type,
+            value,
+            ordered=ordered,
+            reduction_order=reduction_order,
+            reduction_grouping=reduction_grouping,
+        )
         num_outputs = reduction_num_outputs(reduction_type)
         if num_outputs > 1:
             return tuple(result[i] for i in range(num_outputs))

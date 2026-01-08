@@ -566,6 +566,8 @@ class MetalKernel(SIMDKernel):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Union[CSEVariable, tuple[CSEVariable, ...]],
+        ordered: bool = False,
+        reduction_order: Any = None,
     ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
         "Caching wrapper around _reduction_nocache"
         cache_key = (src_dtype, reduction_type, value)

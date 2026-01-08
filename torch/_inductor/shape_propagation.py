@@ -1,6 +1,6 @@
 import functools
 from collections.abc import Callable, Sequence
-from typing import Optional, Protocol, Union
+from typing import Any, Optional, Protocol, Union
 
 import sympy
 
@@ -103,6 +103,8 @@ class ShapePropagationOpsHandler:
         src_dtype: torch.dtype,
         reduction_type: str,
         value: Union[ShapeArg, tuple[ShapeArg, ...]],
+        ordered: bool = False,
+        reduction_order: Any = None,
     ) -> Union[BlockShapeType, tuple[BlockShapeType, ...]]:
         raise NotImplementedError
 

@@ -240,7 +240,12 @@ class DtypePropagationOpsHandler:
 
     @staticmethod
     def reduction(
-        dtype: torch.dtype, src_dtype: torch.dtype, reduction_type: str, value: DTypeArg
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type: str,
+        value: DTypeArg,
+        ordered: bool = False,
+        reduction_order: Any = None,
     ) -> torch.dtype:
         return dtype
 

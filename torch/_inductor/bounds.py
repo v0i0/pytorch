@@ -186,6 +186,8 @@ class ValueRangeAnalysis(SymPyValueRangeAnalysis, DefaultHandler):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Any,
+        ordered: bool = False,
+        reduction_order: Any = None,
     ) -> ValueRanges[Any]:
         return ValueRanges.unknown()
 

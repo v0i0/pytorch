@@ -2287,7 +2287,9 @@ class CppKernel(Kernel):
                 f"{result}_local = cascade_sum_final(&{helper_val});"
             )
 
-    def reduction(self, dtype, src_dtype, reduction_type, value):
+    def reduction(
+        self, dtype, src_dtype, reduction_type, value, ordered=False, reduction_order=None
+    ):
         argmax_or_argmin = reduction_type in ("argmax", "argmin")
         reduction_key = src_dtype, reduction_type, value
         if reduction_key in self.reduction_cse.reduction_cache:
@@ -2983,7 +2985,9 @@ class CppVecKernel(CppKernel):
         else:
             raise NotImplementedError(f"store mode={mode}")
 
-    def reduction(self, dtype, src_dtype, reduction_type, value):
+    def reduction(
+        self, dtype, src_dtype, reduction_type, value, ordered=False, reduction_order=None
+    ):
         """
         Perform vectorized reduction operation.
 
@@ -2996,6 +3000,8 @@ class CppVecKernel(CppKernel):
             src_dtype: The source data type of the input value
             reduction_type: Type of reduction operation (sum, min, max, etc.)
             value: The input value to reduce
+            ordered: Whether to preserve element order for numerical reproducibility
+            reduction_order: The reduction tree structure as a tuple of strides
 
         Returns:
             The result of the reduction operation

@@ -6645,6 +6645,63 @@ def sum_(x, axis=None, keepdims=False, *, dtype=None):
     return fn(x, axis, keepdims, dtype=dtype)
 
 
+@register_lowering(inductor_prims.ordered_sum, type_promotion_kind=None)
+def ordered_sum(x, dim, order, grouping):
+    """
+    Lowering for ordered_sum - creates a Reduction with ordered=True.
+
+    The order list specifies the flattened strides for element combination order.
+    The grouping list specifies how elements in order are grouped for nested orders.
+
+    Examples:
+        Flat order (4, 2, 1): order=[4, 2, 1], grouping=[]
+        Nested order ((4, 2), 1): order=[4, 2, 1], grouping=[2, 1]
+    """
+    if not isinstance(dim, int):
+        raise ValueError(f"ordered_sum requires a single integer dim, got {type(dim)}")
+    # Accept both tuples and list-like types (FX tracing converts lists to immutable_list)
+    if not isinstance(order, (tuple, list)):
+        raise ValueError(f"ordered_sum requires order to be a tuple or list, got {type(order)}")
+    if not isinstance(grouping, (tuple, list)):
+        raise ValueError(f"ordered_sum requires grouping to be a tuple or list, got {type(grouping)}")
+    # Convert to tuple for consistency
+    order = tuple(order)
+    grouping = tuple(grouping) if grouping else None
+
+    # Handle dtype promotion for integer/boolean inputs
+    dtype = None
+    if is_integer_dtype(x.get_dtype()) or is_boolean_dtype(x.get_dtype()):
+        dtype = torch.int64
+
+    # Use _make_reduction_inner to set up the reduction
+    kwargs = _make_reduction_inner(
+        x,
+        axis=dim,
+        keepdims=False,
+        dtype=dtype,
+        override_return_dtype=dtype,
+        reduction_type="sum",
+    )
+
+    # Create the ordered reduction
+    result = Reduction.create(
+        reduction_type="sum",
+        input_node=x,
+        ordered=True,
+        reduction_order=order,
+        reduction_grouping=grouping,
+        **kwargs,
+    )
+
+    if isinstance(
+        result.data.data,  # type: ignore[attr-defined, attr-type, union-attr]
+        Reduction,
+    ):  # Only realize if reduction isn't unrolled
+        result.realize()
+
+    return result
+
+
 fallback_cumsum = fallback_handler(aten.cumsum.default)
 fallback_cumprod = fallback_handler(aten.cumprod.default)
 fallback_logcumsumexp = fallback_handler(aten.logcumsumexp.default)

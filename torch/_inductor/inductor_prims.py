@@ -114,6 +114,51 @@ fma = make_prim(
     doc="Fused multiply add: fma(a, b, c) -> (a * b) + c without rounding after the multiplication",
     tags=(torch.Tag.pointwise,),
 )
+
+
+def eager_ordered_sum(x: Tensor, dim: int, order: list, grouping: list) -> Tensor:
+    """Eager implementation of ordered_sum - just does regular sum.
+
+    The order and grouping parameters only affect the compiled (Triton) code
+    generation path, where they control the element combination order for
+    numerical reproducibility. In eager mode, we just perform a standard sum.
+    """
+    return x.sum(dim=dim)
+
+
+ordered_sum = make_prim(
+    "ordered_sum(Tensor x, int dim, int[] order, int[] grouping) -> Tensor",
+    eager_ordered_sum,
+    doc="""Ordered reduction sum with specified element ordering.
+
+Performs summation along `dim` with elements combined in the order
+specified by `order` and `grouping`. This ensures numerical reproducibility
+by controlling the associativity of floating-point additions.
+
+Args:
+    x: Input tensor
+    dim: Dimension to reduce (single dimension only)
+    order: Flattened strides list, e.g., [4, 2, 1]
+    grouping: How elements in `order` are grouped into tuples, e.g., [2, 1].
+              Empty list [] means flat order (standard binary tree reduction).
+
+Encoding nested orders:
+    Nested order ((4, 2), 1) is encoded as order=[4, 2, 1], grouping=[2, 1]
+    - First 2 elements form a tuple (4, 2), then 1 element (1)
+
+Examples:
+    # Flat order (4, 2, 1) - binary tree reduction for 8 elements
+    ordered_sum(x, dim=1, order=[4, 2, 1], grouping=[])
+    # Result: (((e0+e4)+(e2+e6))+((e1+e5)+(e3+e7)))
+
+    # Nested order ((4, 2), 1) - hierarchical for 8 elements
+    ordered_sum(x, dim=1, order=[4, 2, 1], grouping=[2, 1])
+    # Groups of 4 with inner tree (4,2), combined at stride 1
+
+Raises:
+    RuntimeError: If the specified order cannot be achieved in compiled code.
+""",
+)
 prepare_softmax_online = make_prim(
     "prepare_softmax_online(Tensor a, int dim) -> (Tensor, Tensor)",
     eager_prepare_softmax,

@@ -860,6 +860,8 @@ class FreeSymbolsOpsHandler(DefaultHandler):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Union[None, tuple[None, ...]],
+        ordered: bool = False,
+        reduction_order: Any = None,
     ) -> Union[None, tuple[None, ...]]:
         num_values = reduction_num_outputs(reduction_type)
         return (None,) * num_values if num_values > 1 else None

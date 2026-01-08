@@ -281,6 +281,40 @@ def is_nested_order(order: tuple) -> bool:
     return False
 
 
+def decode_nested_order(order: list, grouping: list) -> tuple:
+    """
+    Decode (order, grouping) back to nested order tuple.
+
+    The grouping list specifies how many consecutive elements in order
+    form each tuple.
+
+    Examples:
+        decode_nested_order([4, 2, 1], [2, 1]) → ((4, 2), 1)
+        decode_nested_order([4, 2, 1], []) → (4, 2, 1)  # flat
+        decode_nested_order([8, 4, 2, 1], [2, 2]) → ((8, 4), (2, 1))
+        decode_nested_order([4, 2, 1, 8], [2, 1, 1]) → ((4, 2), 1, 8)
+    """
+    if not grouping:
+        return tuple(order)
+
+    result = []
+    idx = 0
+    for g in grouping:
+        if g == 1:
+            result.append(order[idx])
+        else:
+            result.append(tuple(order[idx : idx + g]))
+        idx += g
+
+    if idx != len(order):
+        raise ValueError(
+            f"Grouping {grouping} doesn't match order length {len(order)}: "
+            f"sum(grouping)={sum(grouping)} != {len(order)}"
+        )
+
+    return tuple(result)
+
+
 def compute_element_order(n: int, strides: tuple) -> list:
     """
     Compute element visit order from flat stride tuple using bit-interleaving.

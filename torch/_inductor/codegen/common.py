@@ -1061,6 +1061,9 @@ class OpOverrides(BasicMathOpsMixin, OpDecompositions, OpsHandler[Any]):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Union[OpVarT, tuple[OpVarT, ...]],
+        ordered: bool = False,
+        reduction_order: Any = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> Union[OpVarT, tuple[OpVarT, ...]]:
         raise NotImplementedError(
             f"{type(self).__name__}: reduction should be handled by CSEProxy"
@@ -2186,6 +2189,9 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Union[CSEVariable, tuple[CSEVariable, ...]],
+        ordered: bool = False,
+        reduction_order: Any = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
         raise NotImplementedError
 
@@ -2814,9 +2820,14 @@ class CSEProxy(DefaultHandler):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Union[CSEVariable, tuple[CSEVariable, ...]],
+        ordered: bool = False,
+        reduction_order: Any = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
         self.kernel.num_reduction += 1
-        return self.kernel.reduction(dtype, src_dtype, reduction_type, value)
+        return self.kernel.reduction(
+            dtype, src_dtype, reduction_type, value, ordered, reduction_order, reduction_grouping
+        )
 
     def scan(
         self,

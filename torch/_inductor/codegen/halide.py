@@ -1201,6 +1201,8 @@ class HalideKernel(SIMDKernel):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Union[CSEVariable, tuple[CSEVariable, ...]],
+        ordered: bool = False,
+        reduction_order: Any = None,
     ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
         """Codegen a reduction operation"""
         assert self.inside_reduction

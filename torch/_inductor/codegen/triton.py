@@ -3771,6 +3771,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         value: Union[CSEVariable, tuple[CSEVariable, ...]],
         ordered: bool = False,
         reduction_order: Optional[tuple[Any, ...]] = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> Union[CSEVariable, tuple[CSEVariable, ...]]:
         """
         codegen reduction of value to Triton according the reduction_type
@@ -3780,6 +3781,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         reduction_order specifies the reduction tree structure as a tuple of strides:
         e.g., (4, 2, 1) for 8 elements. If None, uses consecutive linear order.
+
+        reduction_grouping specifies how elements in reduction_order are grouped
+        for nested orders. e.g., (2, 1) with order (4, 2, 1) decodes to ((4, 2), 1).
         """
 
         def maybe_upcast(value: CSEVariable) -> CSEVariable:
@@ -3917,90 +3921,57 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             Helper to generate an ordered reduction with specified element ordering.
 
             Order specification (from PR 167498):
-            - Flat tuple (4, 2, 1): TREE reduction with stride-based reordering
+            - Flat order (4, 2, 1): TREE reduction with stride-based reordering
               Elements reordered to [0,4,2,6,1,5,3,7], then binary tree sum:
               (((0+4)+(2+6))+((1+5)+(3+7)))
 
-            - Nested tuple ((2, 1), 4): LINEAR within groups, then combine
-              Group 1: [0,1,2,3] reordered by (2,1) → [0,2,1,3] → linear: (((0+2)+1)+3)
-              Group 2: [4,5,6,7] reordered by (2,1) → [4,6,5,7] → linear: (((4+6)+5)+7)
-              Final: combine groups at stride 4
+            - Nested order ((4, 2), 1) encoded as order=[4,2,1], grouping=[2,1]:
+              LINEAR within groups, then combine at outer strides
+
+            Raises RuntimeError if the specified order cannot be achieved.
             """
             from torch._inductor.runtime.triton_helpers import (
                 compute_element_order,
                 compute_hierarchical_reduction_structure,
-                generate_linear_sum_indices,
-                generate_tree_sum_expression,
+                decode_nested_order,
+                flatten_order,
                 is_nested_order,
             )
 
+            if reduction_type != "sum":
+                raise RuntimeError(
+                    f"Ordered reduction only supported for 'sum', got '{reduction_type}'"
+                )
+
+            if reduction_order is None:
+                raise RuntimeError(
+                    "ordered_final_reduction requires a reduction_order tuple"
+                )
+
             value = self.reduction_collapse_dims(buffer, value, dtype)
 
-            # Get the ordered reduction function name for fallback
-            ordered_fn_map = {
-                "sum": "ordered_sum",
-                "prod": "ordered_prod",
-                "max": "ordered_max",
-                "min": "ordered_min",
-            }
-            if reduction_type not in ordered_fn_map:
-                raise NotImplementedError(
-                    f"Ordered reduction not yet implemented for {reduction_type}"
+            # Decode nested order from (order, grouping) encoding
+            # If grouping is provided, decode to nested tuple
+            if reduction_grouping:
+                decoded_order = decode_nested_order(
+                    list(reduction_order), list(reduction_grouping)
                 )
-            ordered_fn = ordered_fn_map[reduction_type]
+            else:
+                decoded_order = reduction_order
 
-            if reduction_order is not None and reduction_type == "sum":
-                # Generate specialized code for the specified order
-                # For now, we support sum with hierarchical ordering
-                try:
-                    # Get reduction size from RBLOCK
-                    rblock = self.dense_size_list()[-1]  # Last dim is reduction
-
-                    # Analyze the order structure
-                    if not is_nested_order(reduction_order):
-                        # Flat tuple = tree reduction with stride reordering
-                        # Example: (4, 2, 1) for 8 elements
-                        # → reorder [0,4,2,6,1,5,3,7], then binary tree
-                        #
-                        # Generated code pattern:
-                        # tmp = tl.reshape(value, [n//2, 2])
-                        # ... apply tree levels ...
-                        #
-                        # For simplicity, we use the linear sum with computed order
-                        # which gives the same numerical result
-                        import logging
-                        log = logging.getLogger(__name__)
-                        log.debug(
-                            "Ordered tree reduction with order=%s (using linear sum "
-                            "over reordered elements for equivalent numerics)",
-                            reduction_order
-                        )
-                    else:
-                        # Nested tuple = hierarchical with linear within groups
-                        # Example: ((2, 1), 4) for 8 elements
-                        # → linear sum within each group, then combine
-                        import logging
-                        log = logging.getLogger(__name__)
-                        log.debug(
-                            "Ordered hierarchical reduction with order=%s",
-                            reduction_order
-                        )
-
-                except Exception as e:
-                    import logging
-                    log = logging.getLogger(__name__)
-                    log.warning(
-                        "Failed to generate hierarchical reduction for order=%s: %s. "
-                        "Falling back to sequential.",
-                        reduction_order, e
-                    )
-
-            # Use the ordered_sum helper which does linear sequential sum
-            # For tree reductions, this gives equivalent numerical results
-            # when elements are accessed in the computed order
-            result, shape = self.reduction_resize_and_shape(  # type: ignore[assignment]
-                f"triton_helpers.{ordered_fn}({value}, {dim})", value.shape
-            )
+            # Analyze the order structure
+            if not is_nested_order(decoded_order):
+                # Flat tuple = tree reduction with stride-based splitting
+                # Example: (4, 2, 1) for 8 elements
+                result, shape = _generate_tree_reduction(
+                    buffer, value, decoded_order
+                )
+            else:
+                # Nested tuple = hierarchical with linear within groups
+                # Example: ((4, 2), 1) for 8 elements
+                result, shape = _generate_hierarchical_reduction(
+                    buffer, value, decoded_order
+                )
 
             if result_type is not None:
                 result = f"{result}.to({self.dtype_to_str(result_type)})"
@@ -4008,6 +3979,261 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 result_type = value.dtype
 
             return result, result_type, shape
+
+        def _generate_tree_reduction(
+            buffer,
+            value: CSEVariable,
+            reduction_order: tuple,
+        ) -> tuple[str, BlockShapeType]:
+            """
+            Generate optimized tree reduction code for flat order tuples.
+
+            For a standard binary tree order like (n//2, n//4, ..., 2, 1),
+            uses tl.reshape + tl.sum to implement pairwise reduction at each level.
+
+            For (4, 2, 1) on 8 elements:
+            - Level 1: reshape [X,8]->[X,2,4], sum axis=1 -> [X,4] = (e0+e4, e1+e5, e2+e6, e3+e7)
+            - Level 2: reshape [X,4]->[X,2,2], sum axis=1 -> [X,2] = ((e0+e4)+(e2+e6), (e1+e5)+(e3+e7))
+            - Level 3: reshape [X,2]->[X,2,1], sum axis=1 -> [X,1] = final result
+
+            Raises RuntimeError if order is not a standard binary tree.
+            """
+            from torch._inductor.runtime.triton_helpers import flatten_order
+
+            flat_strides = flatten_order(reduction_order)
+            num_levels = len(flat_strides)
+
+            if num_levels == 0:
+                raise RuntimeError(
+                    f"Invalid reduction order {reduction_order}: empty strides"
+                )
+
+            # Check if strides form a valid binary tree pattern
+            # Valid pattern: each stride is 2x the next (n//2, n//4, ..., 2, 1)
+            for i in range(len(flat_strides) - 1):
+                if flat_strides[i] != 2 * flat_strides[i + 1]:
+                    raise RuntimeError(
+                        f"Unsupported reduction order {reduction_order}: "
+                        f"not a standard binary tree pattern. "
+                        f"Stride {flat_strides[i]} != 2 * {flat_strides[i + 1]}"
+                    )
+            if flat_strides[-1] != 1:
+                raise RuntimeError(
+                    f"Unsupported reduction order {reduction_order}: "
+                    f"last stride must be 1, got {flat_strides[-1]}"
+                )
+
+            n = 1 << num_levels  # 2^num_levels total elements
+
+            # Generate tree reduction using reshape + sum
+            # At each level: reshape [XBLOCK, current] -> [XBLOCK, 2, current//2]
+            # then sum along axis=1 to get [XBLOCK, current//2]
+            current_var = value
+            current_size = n
+
+            # Get XBLOCK from shape (first dimension)
+            if value.shape:
+                xblock = value.shape[0]
+            else:
+                xblock = "XBLOCK"
+
+            for level in range(num_levels):
+                half_size = current_size // 2
+                # Reshape to [XBLOCK, 2, half_size] - splits into first/second halves
+                reshaped_var = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, 2, half_size)
+                )
+                buffer.writeline(
+                    f"{reshaped_var} = tl.reshape({current_var}, [{xblock}, 2, {half_size}])"
+                )
+                # Sum along axis=1 (the split dimension) to combine halves
+                summed_var = self.cse.newvar(dtype=value.dtype, shape=(xblock, half_size))
+                buffer.writeline(f"{summed_var} = tl.sum({reshaped_var}, axis=1)")
+                current_var = summed_var
+                current_size = half_size
+
+            # Final shape is [XBLOCK, 1], squeeze it to [XBLOCK] using reshape
+            squeezed_var = self.cse.newvar(dtype=value.dtype, shape=(xblock,))
+            buffer.writeline(
+                f"{squeezed_var} = tl.reshape({current_var}, [{xblock}])"
+            )
+
+            # Add the [:, None] expansion for the store operation
+            # But we need to do this without Python slice syntax - use reshape
+            ndims = self.triton_tensor_ndim()
+            nreduce = self.num_reduction_dims
+            if ndims > 1 and nreduce > 0:
+                # Need to add trailing dimensions for proper broadcasting
+                # Build shape string properly - xblock could be string "XBLOCK" or int
+                shape_parts = [str(xblock)] + ["1"] * nreduce
+                shape_str = "[" + ", ".join(shape_parts) + "]"
+                final_shape_tuple = (xblock,) + (1,) * nreduce
+                final_var = self.cse.newvar(
+                    dtype=value.dtype, shape=final_shape_tuple
+                )
+                buffer.writeline(
+                    f"{final_var} = tl.reshape({squeezed_var}, {shape_str})"
+                )
+                return str(final_var), final_shape_tuple
+            else:
+                return str(squeezed_var), (xblock,)
+
+        def _generate_hierarchical_reduction(
+            buffer,
+            value: CSEVariable,
+            reduction_order: tuple,
+        ) -> tuple[str, BlockShapeType]:
+            """
+            Generate hierarchical reduction code for nested order tuples.
+
+            For ((2, 1), 4) on 8 elements:
+            - Split into 2 groups of 4 elements each (based on outer stride 4)
+            - Within each group, do linear sum following inner order (2, 1)
+            - Combine the group results
+
+            Linear sum within group follows the computed element order:
+            For inner order (2, 1) on 4 elements: order [0, 2, 1, 3]
+            Result: (((e[0] + e[2]) + e[1]) + e[3])
+
+            Uses tl.reshape + tl.split to extract individual elements.
+            """
+            from torch._inductor.runtime.triton_helpers import (
+                compute_element_order,
+                flatten_order as _flatten_order,
+            )
+
+            # Get dense sizes for shape info
+            dense_sizes = self.dense_size_list()
+            if not dense_sizes:
+                raise RuntimeError(
+                    "Cannot determine reduction size for hierarchical reduction"
+                )
+
+            # Parse the nested order
+            inner_order, outer_stride = reduction_order[0], reduction_order[1]
+            if not isinstance(inner_order, tuple):
+                raise RuntimeError(
+                    f"Invalid nested order {reduction_order}: first element must be a tuple"
+                )
+            if not isinstance(outer_stride, int):
+                raise RuntimeError(
+                    f"Invalid nested order {reduction_order}: second element must be an int"
+                )
+
+            # Compute sizes
+            inner_strides = list(inner_order)
+            group_size = 1 << len(inner_strides)  # 2^(number of inner strides)
+            total_strides = len(_flatten_order(reduction_order))
+            total_elements = 1 << total_strides  # 2^total_strides
+            num_groups = total_elements // group_size
+
+            # Compute element order within each group
+            inner_element_order = compute_element_order(group_size, inner_order)
+
+            # Shape after extracting single element: remove last dimension
+            reduced_shape = value.shape[:-1] if value.shape else ()
+
+            # Get XBLOCK string
+            xblock_str = dense_sizes[0] if dense_sizes else "XBLOCK"
+
+            # Use reshape + split to extract all elements
+            # For n elements, we use log2(n) levels of binary splits
+            # After reshape [X, n] -> [X, n/2, 2] and split:
+            # - left gets elements at even positions: 0, 2, 4, ...
+            # - right gets elements at odd positions: 1, 3, 5, ...
+
+            def extract_elements(var_name: str, n: int) -> list[str]:
+                """Extract all n elements from var [XBLOCK, n] into list of [XBLOCK] vars."""
+                if n == 1:
+                    reshaped = self.cse.newvar(dtype=value.dtype, shape=reduced_shape)
+                    buffer.writeline(
+                        f"{reshaped} = tl.reshape({var_name}, [{xblock_str}])"
+                    )
+                    return [str(reshaped)]
+
+                if n == 2:
+                    # Reshape to [XBLOCK, 1, 2] and split
+                    shape_3d = (xblock_str, "1", "2")
+                    reshaped = self.cse.newvar(dtype=value.dtype, shape=shape_3d)
+                    buffer.writeline(
+                        f"{reshaped} = tl.reshape({var_name}, [{xblock_str}, 1, 2])"
+                    )
+                    shape_split = (xblock_str, "1", "1")
+                    left = self.cse.newvar(dtype=value.dtype, shape=shape_split)
+                    right = self.cse.newvar(dtype=value.dtype, shape=shape_split)
+                    buffer.writeline(f"{left}, {right} = tl.split({reshaped})")
+                    left_flat = self.cse.newvar(dtype=value.dtype, shape=reduced_shape)
+                    right_flat = self.cse.newvar(dtype=value.dtype, shape=reduced_shape)
+                    buffer.writeline(
+                        f"{left_flat} = tl.reshape({left}, [{xblock_str}])"
+                    )
+                    buffer.writeline(
+                        f"{right_flat} = tl.reshape({right}, [{xblock_str}])"
+                    )
+                    return [str(left_flat), str(right_flat)]
+
+                # n > 2: reshape to [XBLOCK, n/2, 2] and split
+                half = n // 2
+                shape_3d = (xblock_str, str(half), "2")
+                reshaped = self.cse.newvar(dtype=value.dtype, shape=shape_3d)
+                buffer.writeline(
+                    f"{reshaped} = tl.reshape({var_name}, [{xblock_str}, {half}, 2])"
+                )
+                shape_split = (xblock_str, str(half), "1")
+                left = self.cse.newvar(dtype=value.dtype, shape=shape_split)
+                right = self.cse.newvar(dtype=value.dtype, shape=shape_split)
+                buffer.writeline(f"{left}, {right} = tl.split({reshaped})")
+
+                # Reshape to [XBLOCK, half]
+                shape_2d = (xblock_str, str(half))
+                left_flat = self.cse.newvar(dtype=value.dtype, shape=shape_2d)
+                right_flat = self.cse.newvar(dtype=value.dtype, shape=shape_2d)
+                buffer.writeline(
+                    f"{left_flat} = tl.reshape({left}, [{xblock_str}, {half}])"
+                )
+                buffer.writeline(
+                    f"{right_flat} = tl.reshape({right}, [{xblock_str}, {half}])"
+                )
+
+                # Recursively extract
+                left_elems = extract_elements(str(left_flat), half)
+                right_elems = extract_elements(str(right_flat), half)
+
+                # Interleave: left has evens, right has odds
+                result = []
+                for i in range(half):
+                    result.append(left_elems[i])  # element 2*i
+                    result.append(right_elems[i])  # element 2*i+1
+                return result
+
+            # Simplest approach: extract all elements, then group and sum
+            all_elements = extract_elements(str(value), total_elements)
+
+            # Now sum elements in the correct order for each group
+            group_results = []
+            for g in range(num_groups):
+                group_start = g * group_size
+                # Sum in inner_element_order
+                acc_var = all_elements[group_start + inner_element_order[0]]
+                for idx in inner_element_order[1:]:
+                    abs_idx = group_start + idx
+                    elem_var = all_elements[abs_idx]
+                    new_acc = self.cse.newvar(dtype=value.dtype, shape=reduced_shape)
+                    buffer.writeline(f"{new_acc} = {acc_var} + {elem_var}")
+                    acc_var = str(new_acc)
+                group_results.append(acc_var)
+
+            # Combine group results
+            result_var = group_results[0]
+            for g in range(1, num_groups):
+                new_result = self.cse.newvar(dtype=value.dtype, shape=reduced_shape)
+                buffer.writeline(f"{new_result} = {result_var} + {group_results[g]}")
+                result_var = str(new_result)
+
+            # Final result
+            result, shape = self.reduction_resize_and_shape(result_var, value.shape)
+
+            return result, shape
 
         def ordered_final_reduction_define(
             buffer,

@@ -1238,6 +1238,10 @@ class Reduction(Loops):
     #   - Finally pair with stride 1: sum all
     # If None but ordered=True, uses consecutive linear order (1, 2, 4, 8, ...)
     reduction_order: Optional[tuple[Any, ...]] = None
+    # Grouping for nested orders: specifies how elements in reduction_order are grouped
+    # e.g., (2, 1) with reduction_order (4, 2, 1) decodes to nested order ((4, 2), 1)
+    # Empty/None means flat order (standard binary tree reduction)
+    reduction_grouping: Optional[tuple[int, ...]] = None
 
     def __str__(self) -> str:
         fields = ["ranges", "reduction_ranges", "reduction_type"]
@@ -1245,6 +1249,8 @@ class Reduction(Loops):
             fields.append("ordered")
         if self.reduction_order is not None:
             fields.append("reduction_order")
+        if self.reduction_grouping is not None:
+            fields.append("reduction_grouping")
         return self._to_str(tuple(fields))
 
     __repr__ = __str__
@@ -1269,6 +1275,10 @@ class Reduction(Loops):
         """Return the reduction order specification, or None for default order."""
         return self.reduction_order
 
+    def get_reduction_grouping(self) -> Optional[tuple[int, ...]]:
+        """Return the reduction grouping for nested orders, or None for flat orders."""
+        return self.reduction_grouping
+
     def store_reduction(
         self,
         output_name: Optional[str],
@@ -1283,6 +1293,7 @@ class Reduction(Loops):
             self.inner_fn(vars, reduction_vars),
             ordered=self.ordered,
             reduction_order=self.reduction_order,
+            reduction_grouping=self.reduction_grouping,
         )
         ops.store_reduction(output_name or "unnamed", indexer(vars), value)
 
@@ -1547,6 +1558,7 @@ class Reduction(Loops):
         input_node: Optional[IRNode] = None,
         ordered: bool = False,
         reduction_order: Optional[tuple[Any, ...]] = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> TensorBox:
         """
         Create a reduction node. May split the reduction to multiple layers to expose
@@ -1561,6 +1573,10 @@ class Reduction(Loops):
           - Then pair with stride 2: ((0+4)+(2+6)), ((1+5)+(3+7))
           - Finally pair with stride 1
         If None but ordered=True, uses consecutive linear order (1, 2, 4, 8, ...).
+
+        reduction_grouping specifies how elements in reduction_order are grouped for
+        nested orders. e.g., (2, 1) with reduction_order (4, 2, 1) decodes to ((4, 2), 1).
+        Empty/None means flat order (standard binary tree reduction).
         """
         reduction_numel = V.graph.sizevars.simplify(sympy_product(reduction_ranges))
 
@@ -1687,6 +1703,7 @@ class Reduction(Loops):
                 reduction_hint,
                 ordered=ordered,
                 reduction_order=reduction_order,
+                reduction_grouping=reduction_grouping,
             )
         elif split > 1:
             # triton doesn't support reduce to single element well, so break it up
@@ -1703,6 +1720,7 @@ class Reduction(Loops):
                 input_node,
                 ordered=ordered,
                 reduction_order=reduction_order,
+                reduction_grouping=reduction_grouping,
             )
 
             # Find the reduction that get split
@@ -1757,6 +1775,7 @@ class Reduction(Loops):
                 reduction_hint=reduction_hint,
                 ordered=ordered,
                 reduction_order=reduction_order,
+                reduction_grouping=reduction_grouping,
             )
         )
         return out
@@ -1938,6 +1957,7 @@ class Reduction(Loops):
         reduction_hint: ReductionHint,
         ordered: bool = False,
         reduction_order: Optional[tuple[Any, ...]] = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> TensorBox:
         """
         Break a large reduction up into multiple smaller reductions
@@ -1962,6 +1982,7 @@ class Reduction(Loops):
             reduction_hint,
             ordered=ordered,
             reduction_order=reduction_order,
+            reduction_grouping=reduction_grouping,
         )
         intermediate.realize()
         intermediate_loader = intermediate.make_loader()
@@ -1989,6 +2010,7 @@ class Reduction(Loops):
                 reduction_hint=reduction_hint,
                 ordered=ordered,
                 reduction_order=reduction_order,
+                reduction_grouping=reduction_grouping,
             )
         )
 
@@ -2007,6 +2029,7 @@ class Reduction(Loops):
         input_node: Optional[IRNode] = None,
         ordered: bool = False,
         reduction_order: Optional[tuple[Any, ...]] = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> TensorBox:
         """
         Break a large reduction up into multiple smaller reductions
@@ -2040,6 +2063,7 @@ class Reduction(Loops):
             reduction_hint,
             ordered=ordered,
             reduction_order=reduction_order,
+            reduction_grouping=reduction_grouping,
         )
 
     @classmethod
@@ -2057,6 +2081,7 @@ class Reduction(Loops):
         reduction_hint: ReductionHint,
         ordered: bool = False,
         reduction_order: Optional[tuple[Any, ...]] = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> TensorBox:
         """
         Break a large reduction up into multiple smaller reductions
@@ -2083,6 +2108,7 @@ class Reduction(Loops):
             reduction_hint,
             ordered=ordered,
             reduction_order=reduction_order,
+            reduction_grouping=reduction_grouping,
         )
 
 

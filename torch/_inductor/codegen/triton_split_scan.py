@@ -82,7 +82,9 @@ class TritonSplitScanKernel(TritonKernel):
                 )
             )
 
-    def reduction(self, dtype, src_dtype, reduction_type, value):
+    def reduction(
+        self, dtype, src_dtype, reduction_type, value, ordered=False, reduction_order=None
+    ):
         raise NotImplementedError("NYI TritonSplitDimKernel reductions")
 
     def scan(self, dtypes, combine_fn, values):

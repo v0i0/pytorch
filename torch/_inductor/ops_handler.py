@@ -241,6 +241,9 @@ class OpsHandler(Generic[T]):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: T,
+        ordered: bool = False,
+        reduction_order: Optional[tuple[Any, ...]] = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> Union[T, tuple[T, ...]]:
         """
         Perform a 'reduction_type' reduction on 'value' of dtype 'src_dtype',
@@ -1018,8 +1021,19 @@ class KernelFormatterHandler(DefaultHandler):
         src_dtype: torch.dtype,
         reduction_type: ReductionType,
         value: Union[str, tuple[str, ...]],
+        ordered: bool = False,
+        reduction_order: Optional[tuple[Any, ...]] = None,
+        reduction_grouping: Optional[tuple[int, ...]] = None,
     ) -> Union[str, tuple[str, ...]]:
-        line = self.parent_handler.reduction(dtype, src_dtype, reduction_type, value)
+        line = self.parent_handler.reduction(
+            dtype,
+            src_dtype,
+            reduction_type,
+            value,
+            ordered=ordered,
+            reduction_order=reduction_order,
+            reduction_grouping=reduction_grouping,
+        )
         num_values = reduction_num_outputs(reduction_type)
         varnames = [f"tmp{next(self.var_counter)}" for _ in range(num_values)]
         self._output.writeline(f"{','.join(varnames)} = {line}")
