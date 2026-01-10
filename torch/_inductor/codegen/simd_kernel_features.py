@@ -122,6 +122,20 @@ class SIMDKernelFeatures:
         """True if V.ops.{op_name} is used in node_schedule"""
         return bool(self.op_counts().get(op_name))
 
+    @cache_on_self
+    def has_ordered_reduction(self) -> bool:
+        """Check if any node in the schedule has an ordered reduction."""
+        from torch._inductor.ir import ComputedBuffer, Reduction
+
+        for node in self.scheduler_nodes():
+            if not node.is_reduction():
+                continue
+            if not isinstance(node.node, ComputedBuffer):
+                continue
+            if isinstance(node.node.data, Reduction) and node.node.data.ordered:
+                return True
+        return False
+
     def get_mutations(self) -> OrderedSet[str]:
         mutations: OrderedSet[str] = OrderedSet()
         for node in self.scheduler_nodes():

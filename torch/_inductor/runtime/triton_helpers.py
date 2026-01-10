@@ -342,6 +342,40 @@ def compute_element_order(n: int, strides: tuple) -> list:
     return result
 
 
+def partition_order_for_chunk(
+    order: tuple,
+    chunk_size: int,
+) -> tuple[tuple, tuple]:
+    """
+    Partition a reduction order based on chunk size for split reductions.
+
+    When splitting an ordered reduction into multiple kernels, the order
+    must be partitioned so each kernel processes the correct subset:
+    - First kernel: within-chunk strides (strides < chunk_size)
+    - Second kernel: across-chunk strides (strides >= chunk_size, scaled down)
+
+    Args:
+        order: Full reduction order as strides, e.g., (512, 256, 128, ..., 1)
+        chunk_size: Size of each chunk
+
+    Returns:
+        (within_chunk_order, across_chunk_order)
+
+    Example:
+        >>> partition_order_for_chunk((4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1), 1024)
+        ((512, 256, 128, 64, 32, 16, 8, 4, 2, 1), (4, 2, 1))
+    """
+    flat_strides = flatten_order(order)
+
+    # Strides within a chunk (< chunk_size)
+    within_strides = tuple(s for s in flat_strides if s < chunk_size)
+
+    # Strides across chunks (>= chunk_size), scaled down by chunk_size
+    across_strides = tuple(s // chunk_size for s in flat_strides if s >= chunk_size)
+
+    return within_strides, across_strides
+
+
 def compute_hierarchical_reduction_structure(n: int, order: tuple) -> dict:
     """
     Compute the full hierarchical reduction structure from an order tuple.

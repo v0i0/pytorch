@@ -4384,6 +4384,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     self.compute, _result, dtype=_dtype, shape=_shape
                 )
         else:
+            # Non-persistent reduction path
+            # Note: ordered reductions always use persistent mode (see
+            # create_triton_kernel override_persistent_reduction), so this
+            # path is only used for non-ordered reductions.
             accumulator = self.cse.namedvar(
                 f"_{result_var}",
                 dtype=torch_acc_type,
@@ -4400,13 +4404,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     ]
                     accumulator.shape = tuple(xy_sizes_only)
                     dense_size_str = f"[{', '.join(xy_sizes_only)}]"
-                    self.body.writeline(
-                        f"{accumulator} = tl.full({dense_size_str}, {default}, {acc_type})"
-                    )
-                else:
-                    self.body.writeline(
-                        f"{accumulator} = tl.full({self.dense_size_str()}, {default}, {acc_type})"
-                    )
+                self.body.writeline(
+                    f"{accumulator} = tl.full({dense_size_str}, {default}, {acc_type})"
+                )
+            else:
+                self.body.writeline(
+                    f"{accumulator} = tl.full({self.dense_size_str()}, {default}, {acc_type})"
+                )
 
             if reduction_type in ("argmax", "argmin"):
                 accumulator_index = f"_{result_var}_index"
@@ -6474,6 +6478,13 @@ class TritonScheduling(SIMDScheduling):
         # ops.sort only works with persistent reduction, and is not bandwidth bound anyway
         # so taking the hit of non-coalesced loads is okay
         if kernel_features.contains_op("sort"):
+            kernel_kwargs["override_persistent_reduction"] = True
+            kernel_kwargs["override_cooperative_reduction"] = False
+
+        # Ordered reductions require persistent reduction to maintain element ordering
+        # Note: for large ordered reductions, the IR-level split reductions
+        # (create_multilayer) handles partitioning into multiple kernels
+        if kernel_features.has_ordered_reduction():
             kernel_kwargs["override_persistent_reduction"] = True
             kernel_kwargs["override_cooperative_reduction"] = False
 

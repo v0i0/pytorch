@@ -1330,6 +1330,49 @@ class Reduction(Loops):
         )
 
     @staticmethod
+    def partition_order_for_split(
+        order: tuple[int, ...],
+        split: _IntLike,
+        reduction_numel: _IntLike,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """
+        Partition reduction order for multi-layer split.
+
+        When splitting an ordered reduction into multiple kernels, the order
+        must be partitioned so each kernel processes the correct subset:
+        - First kernel: within-chunk strides (strides < chunk_size)
+        - Second kernel: across-chunk strides (strides >= chunk_size, scaled down)
+
+        Example: For order (4096, 2048, 1024, 512, ..., 1) on 8192 elements,
+        split into 8 chunks of 1024 elements each:
+        - within_order: (512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+        - across_order: (4, 2, 1)  # Original (4096, 2048, 1024) / 1024
+
+        Args:
+            order: Full reduction order as strides, e.g., (512, 256, ..., 1)
+            split: Number of chunks to split into
+            reduction_numel: Total number of elements being reduced
+
+        Returns:
+            (within_chunk_order, across_chunk_order)
+        """
+        # Handle symbolic expressions
+        if hasattr(reduction_numel, "__int__"):
+            reduction_numel = int(reduction_numel)
+        if hasattr(split, "__int__"):
+            split = int(split)
+
+        chunk_size = reduction_numel // split
+
+        # Strides within a chunk (< chunk_size)
+        within_strides = tuple(s for s in order if s < chunk_size)
+
+        # Strides across chunks (>= chunk_size), scaled down by chunk_size
+        across_strides = tuple(s // chunk_size for s in order if s >= chunk_size)
+
+        return within_strides, across_strides
+
+    @staticmethod
     def num_splits(
         device: torch.device,
         dst_dtype: torch.dtype,
@@ -1963,6 +2006,21 @@ class Reduction(Loops):
         Break a large reduction up into multiple smaller reductions
         recursively
         """
+        # Partition the reduction order for split ordered reductions
+        # First kernel gets within-chunk order, second kernel gets across-chunk order
+        within_order: Optional[tuple[Any, ...]] = reduction_order
+        across_order: Optional[tuple[Any, ...]] = reduction_order
+
+        if ordered and reduction_order is not None:
+            reduction_numel = V.graph.sizevars.size_hint(
+                sympy_product(original_reduction_ranges)
+            )
+            within_order, across_order = cls.partition_order_for_split(
+                reduction_order, split, reduction_numel
+            )
+            # Clear grouping for split reductions - the hierarchy is handled by partitioning
+            reduction_grouping = None
+
         # triton will automatically compute reductions in fp32 if reducing over fp16/bf16
         # within the kernel. keep the intermediate in fp32 so as to keep the whole reduction
         # in fp32 and not reduce precision by breaking up the kernel into multiple layers
@@ -1981,8 +2039,8 @@ class Reduction(Loops):
             reduction_type,
             reduction_hint,
             ordered=ordered,
-            reduction_order=reduction_order,
-            reduction_grouping=reduction_grouping,
+            reduction_order=within_order,  # First kernel: within-chunk order
+            reduction_grouping=None,  # Flatten for within-chunk
         )
         intermediate.realize()
         intermediate_loader = intermediate.make_loader()
@@ -2009,8 +2067,8 @@ class Reduction(Loops):
                 src_dtype=src_dtype,
                 reduction_hint=reduction_hint,
                 ordered=ordered,
-                reduction_order=reduction_order,
-                reduction_grouping=reduction_grouping,
+                reduction_order=across_order,  # Second kernel: across-chunk order
+                reduction_grouping=None,  # Flatten for across-chunk
             )
         )
 

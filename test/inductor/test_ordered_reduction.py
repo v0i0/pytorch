@@ -455,5 +455,176 @@ class TestDecodeNestedOrder(TestCase):
             decode_nested_order([4, 2, 1], [1, 1])  # sum=2, but need 3
 
 
+class TestPartitionOrderForSplit(TestCase):
+    """Tests for partition_order_for_split helper function."""
+
+    def test_partition_order_basic(self):
+        """Test basic order partitioning for split."""
+        from torch._inductor.ir import Reduction
+
+        # 8192 elements split into 8 chunks of 1024
+        order = (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+        split = 8
+        reduction_numel = 8192
+
+        within, across = Reduction.partition_order_for_split(order, split, reduction_numel)
+
+        # chunk_size = 8192 / 8 = 1024
+        # Strides < 1024: (512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+        # Strides >= 1024: (4096, 2048, 1024) -> (4, 2, 1) after dividing by 1024
+        self.assertEqual(within, (512, 256, 128, 64, 32, 16, 8, 4, 2, 1))
+        self.assertEqual(across, (4, 2, 1))
+
+    def test_partition_order_small(self):
+        """Test order partitioning for small split."""
+        from torch._inductor.ir import Reduction
+
+        # 16 elements split into 2 chunks of 8
+        order = (8, 4, 2, 1)
+        split = 2
+        reduction_numel = 16
+
+        within, across = Reduction.partition_order_for_split(order, split, reduction_numel)
+
+        # chunk_size = 16 / 2 = 8
+        # Strides < 8: (4, 2, 1)
+        # Strides >= 8: (8,) -> (1,) after dividing by 8
+        self.assertEqual(within, (4, 2, 1))
+        self.assertEqual(across, (1,))
+
+    def test_partition_order_helper(self):
+        """Test the triton_helpers partition function."""
+        from torch._inductor.runtime.triton_helpers import partition_order_for_chunk
+
+        order = (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1)
+        chunk_size = 1024
+
+        within, across = partition_order_for_chunk(order, chunk_size)
+
+        self.assertEqual(within, (512, 256, 128, 64, 32, 16, 8, 4, 2, 1))
+        self.assertEqual(across, (4, 2, 1))
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+@torch._inductor.config.patch({"triton.cooperative_reductions": False})
+class TestSplitOrderedReductions(TestCase):
+    """Tests for split ordered reductions (multi-kernel).
+
+    These tests verify that when an ordered reduction is split into multiple
+    kernels, the result is bitwise-identical to the non-split (persistent)
+    version.
+    """
+
+    @staticmethod
+    def get_order_for_size(red_size):
+        """Generate flat tree order for a given reduction size (must be power of 2)."""
+        order = []
+        s = red_size // 2
+        while s >= 1:
+            order.append(s)
+            s //= 2
+        return tuple(order)
+
+    def test_split_ordered_reduction_bitwise_identical_fp32(self):
+        """Verify split ordered reduction matches persistent version exactly (fp32)."""
+        from torch._inductor import inductor_prims
+
+        for size in [2048, 4096]:
+            order = list(self.get_order_for_size(size))
+
+            x = torch.randn(100, size, device="cuda", dtype=torch.float32)
+
+            # Force persistent (no split) - reference
+            with config.patch({"split_reductions": False}):
+                torch._dynamo.reset()
+
+                @torch.compile
+                def persistent_fn(x):
+                    return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+                ref = persistent_fn(x)
+
+            # Allow split - test
+            with config.patch({"split_reductions": True}):
+                torch._dynamo.reset()
+
+                @torch.compile
+                def split_fn(x):
+                    return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+                result = split_fn(x)
+
+            # Must be bitwise identical
+            self.assertTrue(
+                torch.equal(ref, result),
+                f"Mismatch at size={size}, dtype=fp32. "
+                f"Max diff: {(ref - result).abs().max().item()}"
+            )
+
+    def test_split_ordered_reduction_bitwise_identical_fp16(self):
+        """Verify split ordered reduction matches persistent version exactly (fp16)."""
+        from torch._inductor import inductor_prims
+
+        for size in [2048, 4096]:
+            order = list(self.get_order_for_size(size))
+
+            x = torch.randn(100, size, device="cuda", dtype=torch.float16)
+
+            # Force persistent (no split) - reference
+            with config.patch({"split_reductions": False}):
+                torch._dynamo.reset()
+
+                @torch.compile
+                def persistent_fn(x):
+                    return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+                ref = persistent_fn(x)
+
+            # Allow split - test
+            with config.patch({"split_reductions": True}):
+                torch._dynamo.reset()
+
+                @torch.compile
+                def split_fn(x):
+                    return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+                result = split_fn(x)
+
+            # Must be bitwise identical
+            self.assertTrue(
+                torch.equal(ref, result),
+                f"Mismatch at size={size}, dtype=fp16. "
+                f"Max diff: {(ref - result).abs().max().item()}"
+            )
+
+    def test_split_ordered_reduction_reproducibility(self):
+        """Verify split ordered reduction produces identical results across runs."""
+        from torch._inductor import inductor_prims
+
+        size = 4096
+        order = list(self.get_order_for_size(size))
+
+        x = torch.randn(100, size, device="cuda", dtype=torch.float32)
+
+        with config.patch({"split_reductions": True}):
+            results = []
+            for _ in range(5):
+                torch._dynamo.reset()
+
+                @torch.compile
+                def fn(x):
+                    return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+                results.append(fn(x).clone())
+
+            # All runs must be bitwise identical
+            reference = results[0]
+            for i, result in enumerate(results[1:], 1):
+                self.assertTrue(
+                    torch.equal(reference, result),
+                    f"Run {i} differs from run 0"
+                )
+
+
 if __name__ == "__main__":
     run_tests()
