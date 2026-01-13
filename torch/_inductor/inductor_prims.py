@@ -159,6 +159,54 @@ Raises:
     RuntimeError: If the specified order cannot be achieved in compiled code.
 """,
 )
+
+
+def eager_ordered_dot(
+    a: Tensor, b: Tensor, dim: int, order: list, grouping: list
+) -> Tensor:
+    """Eager implementation of ordered_dot - just does regular dot product.
+
+    The order and grouping parameters only affect the compiled (Triton) code
+    generation path, where they control the element combination order for
+    numerical reproducibility using FMA chains. In eager mode, we just perform
+    a standard multiply-sum.
+    """
+    return (a * b).sum(dim=dim)
+
+
+ordered_dot = make_prim(
+    "ordered_dot(Tensor a, Tensor b, int dim, int[] order, int[] grouping) -> Tensor",
+    eager_ordered_dot,
+    doc="""Ordered dot-product reduction with FMA chains at first level.
+
+Computes sum(a * b) along `dim` with elements combined using:
+- FMA chains at the innermost (linear) reduction level
+- Regular ordered addition tree for subsequent levels
+
+This provides better numerical precision than separate multiply + ordered_sum
+because FMA avoids intermediate rounding between multiply and add.
+
+Args:
+    a, b: Input tensors (must be broadcastable along non-reduced dimensions)
+    dim: Dimension to reduce (single dimension only)
+    order: Flattened strides list, e.g., [4, 2, 1]
+    grouping: How elements in `order` are grouped into tuples, e.g., [2, 1].
+              Must produce a nested order for FMA chains to apply.
+
+Semantics:
+    For order=[4, 2, 1], grouping=[2, 1] (nested order ((4,2), 1)) on 8 elements:
+    - Groups of 2 elements, each processed as FMA chain:
+      fma(a[e1], b[e1], a[e0]*b[e0])
+    - Group results combined with ordered addition tree
+
+Examples:
+    # Hierarchical dot with FMA for 8 elements
+    ordered_dot(a, b, dim=1, order=[4, 2, 1], grouping=[2, 1])
+
+Raises:
+    RuntimeError: If the specified order cannot be achieved in compiled code.
+""",
+)
 prepare_softmax_online = make_prim(
     "prepare_softmax_online(Tensor a, int dim) -> (Tensor, Tensor)",
     eager_prepare_softmax,

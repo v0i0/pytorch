@@ -1148,6 +1148,7 @@ REDUCTION_COMBINE_FN: dict[str, Callable[..., OpsValue]] = {
     "prod": ops_wrapper("mul"),
     "sum": ops_wrapper("add"),
     "dot": ops_wrapper("add"),
+    "ordered_dot": ops_wrapper("add"),  # FMA chains combined with addition
     "xor_sum": ops_wrapper("bitwise_xor"),
 }
 
@@ -1681,9 +1682,12 @@ class Reduction(Loops):
             and V.graph.sizevars.size_hint_or_throw(reduction_numel)
             < config.unroll_reductions_threshold
             and (sympy_product(ranges) != 1 or is_gpu(device.type))
-            and reduction_type != "dot"
+            and reduction_type not in ("dot", "ordered_dot")
+            and not ordered
         ):
             # When native matmul, don't unroll the dot reduction.
+            # Don't unroll ordered_dot (returns tuple from inner_fn).
+            # Don't unroll ordered reductions (need ordered reduction codegen).
 
             # NB: This works around https://github.com/pytorch/pytorch/issues/140457
             # since turning reductions into pointwise ops can exacerbate this problem
@@ -1848,6 +1852,7 @@ class Reduction(Loops):
             "sum": zero,
             "prod": one,
             "dot": zero,
+            "ordered_dot": zero,
             "xor_sum": zero,
             "any": zero,
             "welford_reduce": (zero, zero, zero),

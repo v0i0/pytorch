@@ -6702,6 +6702,107 @@ def ordered_sum(x, dim, order, grouping):
     return result
 
 
+@register_lowering(inductor_prims.ordered_dot, type_promotion_kind=None)
+def ordered_dot(a, b, dim, order, grouping):
+    """
+    Lowering for ordered_dot - creates a Reduction with ordered_dot type.
+
+    Uses FMA chains at the first (linear) reduction level within groups,
+    then regular ordered addition tree for combining group results.
+
+    The order list specifies the flattened strides for element combination order.
+    The grouping list specifies how elements in order are grouped for nested orders.
+
+    Examples:
+        Nested order ((4, 2), 1): order=[4, 2, 1], grouping=[2, 1]
+    """
+    if not isinstance(dim, int):
+        raise ValueError(f"ordered_dot requires a single integer dim, got {type(dim)}")
+    # Accept both tuples and list-like types (FX tracing converts lists to immutable_list)
+    if not isinstance(order, (tuple, list)):
+        raise ValueError(
+            f"ordered_dot requires order to be a tuple or list, got {type(order)}"
+        )
+    if not isinstance(grouping, (tuple, list)):
+        raise ValueError(
+            f"ordered_dot requires grouping to be a tuple or list, got {type(grouping)}"
+        )
+    # Convert to tuple for consistency
+    order = tuple(order)
+    grouping = tuple(grouping) if grouping else None
+
+    # Handle dtype promotion for integer/boolean inputs
+    dtype = None
+    if is_integer_dtype(a.get_dtype()) or is_boolean_dtype(a.get_dtype()):
+        dtype = torch.int64
+    if is_integer_dtype(b.get_dtype()) or is_boolean_dtype(b.get_dtype()):
+        dtype = torch.int64
+
+    # Broadcast a and b to common shape
+    a, b = broadcast_tensors(a, b)
+
+    if dtype is not None:
+        a = to_dtype(a, dtype)
+        b = to_dtype(b, dtype)
+
+    size = a.get_size()
+    axis = OrderedSet[int](_validate_reduction_axis(a, dim))
+
+    # Build kept and reduced index lists
+    kept_sizes = []
+    kept_idx = []
+    reduced_sizes = []
+    reduced_idx = []
+    for i in range(len(size)):
+        if i in axis:
+            reduced_idx.append(i)
+            reduced_sizes.append(size[i])
+        else:
+            kept_idx.append(i)
+            kept_sizes.append(size[i])
+
+    # Create loaders for both tensors
+    a_loader = a.make_loader()
+    b_loader = b.make_loader()
+
+    def inner_fn(index, reduction_index):
+        """Inner function that returns (a_val, b_val) tuple for FMA reduction."""
+        assert len(reduction_index) == len(reduced_idx)
+        assert len(index) == len(kept_idx)
+        new_index = [None] * (len(index) + len(reduction_index))
+        for idx, var in itertools.chain(
+            zip(kept_idx, index), zip(reduced_idx, reduction_index)
+        ):
+            new_index[idx] = var
+
+        a_val = a_loader(new_index)
+        b_val = b_loader(new_index)
+        return (a_val, b_val)
+
+    # Create the ordered_dot reduction
+    result = Reduction.create(
+        device=a.get_device(),
+        dst_dtype=dtype or a.get_dtype(),
+        src_dtype=a.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=kept_sizes,
+        reduction_ranges=reduced_sizes,
+        reduction_type="ordered_dot",
+        input_node=a,
+        ordered=True,
+        reduction_order=order,
+        reduction_grouping=grouping,
+    )
+
+    if isinstance(
+        result.data.data,  # type: ignore[attr-defined, attr-type, union-attr]
+        Reduction,
+    ):  # Only realize if reduction isn't unrolled
+        result.realize()
+
+    return result
+
+
 fallback_cumsum = fallback_handler(aten.cumsum.default)
 fallback_cumprod = fallback_handler(aten.cumprod.default)
 fallback_logcumsumexp = fallback_handler(aten.logcumsumexp.default)

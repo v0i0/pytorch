@@ -626,5 +626,136 @@ class TestSplitOrderedReductions(TestCase):
                 )
 
 
+class TestOrderedDotPrim(TestCase):
+    """Tests for the inductor_prims.ordered_dot operation."""
+
+    def test_ordered_dot_prim_exists(self):
+        """Test that ordered_dot prim is defined."""
+        from torch._inductor import inductor_prims
+
+        self.assertTrue(hasattr(inductor_prims, "ordered_dot"))
+
+    def test_ordered_dot_eager_mode(self):
+        """Test ordered_dot in eager mode (no compilation)."""
+        from torch._inductor import inductor_prims
+
+        a = torch.randn(4, 8)
+        b = torch.randn(4, 8)
+        # Nested order required for ordered_dot
+        order = [2, 1, 4]
+        grouping = [2, 1]  # Decodes to ((2, 1), 4)
+
+        # In eager mode, ordered_dot just does (a * b).sum()
+        result = inductor_prims.ordered_dot(a, b, dim=1, order=order, grouping=grouping)
+        expected = (a * b).sum(dim=1)
+
+        self.assertTrue(torch.allclose(result, expected))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    @torch._inductor.config.patch({"triton.cooperative_reductions": False})
+    def test_ordered_dot_compiled_nested_order(self):
+        """Test ordered_dot with nested order under compilation.
+
+        Nested order ((2, 1), 4) for 8 elements:
+        - 2 groups of 4 elements each
+        - Within each group: FMA chain in order [0, 2, 1, 3]
+        - Combine groups with addition
+        """
+        from torch._inductor import inductor_prims
+
+        @torch.compile
+        def fn(a, b):
+            # Nested order ((2, 1), 4) for 8 elements
+            return inductor_prims.ordered_dot(a, b, dim=1, order=[2, 1, 4], grouping=[2, 1])
+
+        a = torch.randn(4, 8, device="cuda")
+        b = torch.randn(4, 8, device="cuda")
+
+        result = fn(a, b)
+        expected = (a * b).sum(dim=1)
+
+        # Results should be equal (same dot product, just different order)
+        self.assertTrue(torch.allclose(result, expected))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    @torch._inductor.config.patch({"triton.cooperative_reductions": False})
+    def test_ordered_dot_compiled_16_elements(self):
+        """Test ordered_dot with 16 elements."""
+        from torch._inductor import inductor_prims
+
+        @torch.compile
+        def fn(a, b):
+            # Nested order ((4, 2, 1), 8) for 16 elements
+            # 2 groups of 8 elements, each processed with FMA chain
+            return inductor_prims.ordered_dot(a, b, dim=1, order=[4, 2, 1, 8], grouping=[3, 1])
+
+        a = torch.randn(4, 16, device="cuda")
+        b = torch.randn(4, 16, device="cuda")
+
+        result = fn(a, b)
+        expected = (a * b).sum(dim=1)
+
+        self.assertTrue(torch.allclose(result, expected))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    @torch._inductor.config.patch({"triton.cooperative_reductions": False})
+    def test_ordered_dot_reproducibility(self):
+        """Test that ordered_dot gives reproducible results."""
+        from torch._inductor import inductor_prims
+
+        a = torch.randn(10, 8, device="cuda")
+        b = torch.randn(10, 8, device="cuda")
+        order = [2, 1, 4]
+        grouping = [2, 1]
+
+        results = []
+        for _ in range(5):
+            torch._dynamo.reset()
+
+            @torch.compile
+            def fn(a, b):
+                return inductor_prims.ordered_dot(a, b, dim=1, order=order, grouping=grouping)
+
+            results.append(fn(a, b).clone())
+
+        # All runs must be bitwise identical
+        reference = results[0]
+        for i, result in enumerate(results[1:], 1):
+            self.assertTrue(
+                torch.equal(reference, result),
+                f"Run {i} differs from run 0"
+            )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    @torch._inductor.config.patch({"triton.cooperative_reductions": False})
+    def test_ordered_dot_broadcast(self):
+        """Test that ordered_dot properly broadcasts inputs."""
+        from torch._inductor import inductor_prims
+
+        @torch.compile
+        def fn(a, b):
+            return inductor_prims.ordered_dot(a, b, dim=1, order=[2, 1, 4], grouping=[2, 1])
+
+        # a has shape [4, 8], b has shape [1, 8] - should broadcast
+        a = torch.randn(4, 8, device="cuda")
+        b = torch.randn(1, 8, device="cuda")
+
+        result = fn(a, b)
+        expected = (a * b).sum(dim=1)
+
+        self.assertTrue(torch.allclose(result, expected))
+
+    def test_ordered_dot_invalid_dim_type(self):
+        """Test that ordered_dot raises error for non-integer dim."""
+        from torch._inductor import inductor_prims
+
+        a = torch.randn(4, 8)
+        b = torch.randn(4, 8)
+
+        with self.assertRaises(RuntimeError):
+            # dim should be int, not list
+            inductor_prims.ordered_dot(a, b, dim=[1], order=[2, 1, 4], grouping=[2, 1])
+
+
 if __name__ == "__main__":
     run_tests()

@@ -3938,17 +3938,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 is_nested_order,
             )
 
-            if reduction_type != "sum":
+            if reduction_type not in ("sum", "ordered_dot"):
                 raise RuntimeError(
-                    f"Ordered reduction only supported for 'sum', got '{reduction_type}'"
+                    f"Ordered reduction only supported for 'sum' and 'ordered_dot', got '{reduction_type}'"
                 )
 
             if reduction_order is None:
                 raise RuntimeError(
                     "ordered_final_reduction requires a reduction_order tuple"
                 )
-
-            value = self.reduction_collapse_dims(buffer, value, dtype)
 
             # Decode nested order from (order, grouping) encoding
             # If grouping is provided, decode to nested tuple
@@ -3959,24 +3957,40 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             else:
                 decoded_order = reduction_order
 
-            # Analyze the order structure
-            if not is_nested_order(decoded_order):
-                # Flat tuple = tree reduction with stride-based splitting
-                # Example: (4, 2, 1) for 8 elements
-                result, shape = _generate_tree_reduction(
-                    buffer, value, decoded_order
+            # Handle ordered_dot separately - value is (a, b) tuple
+            if reduction_type == "ordered_dot":
+                if not isinstance(value, tuple) or len(value) != 2:
+                    raise RuntimeError(
+                        f"ordered_dot expects (a, b) tuple value, got {type(value)}"
+                    )
+                a_value, b_value = value
+                a_value = self.reduction_collapse_dims(buffer, a_value, dtype)
+                b_value = self.reduction_collapse_dims(buffer, b_value, dtype)
+                result, shape = _generate_ordered_dot_reduction(
+                    buffer, a_value, b_value, decoded_order
                 )
             else:
-                # Nested tuple = hierarchical with linear within groups
-                # Example: ((4, 2), 1) for 8 elements
-                result, shape = _generate_hierarchical_reduction(
-                    buffer, value, decoded_order
-                )
+                # Regular ordered sum
+                value = self.reduction_collapse_dims(buffer, value, dtype)
+
+                # Analyze the order structure
+                if not is_nested_order(decoded_order):
+                    # Flat tuple = tree reduction with stride-based splitting
+                    # Example: (4, 2, 1) for 8 elements
+                    result, shape = _generate_tree_reduction(
+                        buffer, value, decoded_order
+                    )
+                else:
+                    # Nested tuple = hierarchical with linear within groups
+                    # Example: ((4, 2), 1) for 8 elements
+                    result, shape = _generate_hierarchical_reduction(
+                        buffer, value, decoded_order
+                    )
 
             if result_type is not None:
                 result = f"{result}.to({self.dtype_to_str(result_type)})"
             else:
-                result_type = value.dtype
+                result_type = value.dtype if not isinstance(value, tuple) else value[0].dtype
 
             return result, result_type, shape
 
@@ -4235,6 +4249,178 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
             return result, shape
 
+        def _generate_ordered_dot_reduction(
+            buffer,
+            a_value: CSEVariable,
+            b_value: CSEVariable,
+            reduction_order: tuple,
+        ) -> tuple[str, BlockShapeType]:
+            """
+            Generate ordered dot-product reduction with FMA chains.
+
+            For nested order like ((2, 1), 4) on 8 elements:
+            1. Extract all (a[i], b[i]) pairs
+            2. Within each group, generate FMA chain:
+               fma(a[e1], b[e1], a[e0]*b[e0])
+               where e0,e1,... follow inner_element_order
+            3. Combine group results with addition tree
+
+            Uses tl.extra.cuda.libdevice.fma for precise FMA operations.
+            """
+            from torch._inductor.runtime.triton_helpers import (
+                compute_element_order,
+                flatten_order as _flatten_order,
+                is_nested_order,
+            )
+
+            # Get dense sizes for shape info
+            dense_sizes = self.dense_size_list()
+            if not dense_sizes:
+                raise RuntimeError(
+                    "Cannot determine reduction size for ordered_dot reduction"
+                )
+
+            # ordered_dot requires nested order for FMA chains
+            if not is_nested_order(reduction_order):
+                raise RuntimeError(
+                    f"ordered_dot requires nested order for FMA chains, got {reduction_order}. "
+                    "Use grouping to create nested order like ((4, 2), 1)."
+                )
+
+            # Parse the nested order
+            inner_order, outer_stride = reduction_order[0], reduction_order[1]
+            if not isinstance(inner_order, tuple):
+                raise RuntimeError(
+                    f"Invalid nested order {reduction_order}: first element must be a tuple"
+                )
+            if not isinstance(outer_stride, int):
+                raise RuntimeError(
+                    f"Invalid nested order {reduction_order}: second element must be an int"
+                )
+
+            # Compute sizes
+            inner_strides = list(inner_order)
+            group_size = 1 << len(inner_strides)  # 2^(number of inner strides)
+            total_strides = len(_flatten_order(reduction_order))
+            total_elements = 1 << total_strides  # 2^total_strides
+            num_groups = total_elements // group_size
+
+            # Compute element order within each group
+            inner_element_order = compute_element_order(group_size, inner_order)
+
+            # Shape after extracting single element: remove last dimension
+            reduced_shape = a_value.shape[:-1] if a_value.shape else ()
+
+            # Get XBLOCK string
+            xblock_str = dense_sizes[0] if dense_sizes else "XBLOCK"
+
+            # Reuse element extraction logic from hierarchical reduction
+            def extract_elements(var_name: str, n: int, var_dtype) -> list[str]:
+                """Extract all n elements from var [XBLOCK, n] into list of [XBLOCK] vars."""
+                if n == 1:
+                    reshaped = self.cse.newvar(dtype=var_dtype, shape=reduced_shape)
+                    buffer.writeline(
+                        f"{reshaped} = tl.reshape({var_name}, [{xblock_str}])"
+                    )
+                    return [str(reshaped)]
+
+                if n == 2:
+                    # Reshape to [XBLOCK, 1, 2] and split
+                    shape_3d = (xblock_str, "1", "2")
+                    reshaped = self.cse.newvar(dtype=var_dtype, shape=shape_3d)
+                    buffer.writeline(
+                        f"{reshaped} = tl.reshape({var_name}, [{xblock_str}, 1, 2])"
+                    )
+                    shape_split = (xblock_str, "1", "1")
+                    left = self.cse.newvar(dtype=var_dtype, shape=shape_split)
+                    right = self.cse.newvar(dtype=var_dtype, shape=shape_split)
+                    buffer.writeline(f"{left}, {right} = tl.split({reshaped})")
+                    left_flat = self.cse.newvar(dtype=var_dtype, shape=reduced_shape)
+                    right_flat = self.cse.newvar(dtype=var_dtype, shape=reduced_shape)
+                    buffer.writeline(
+                        f"{left_flat} = tl.reshape({left}, [{xblock_str}])"
+                    )
+                    buffer.writeline(
+                        f"{right_flat} = tl.reshape({right}, [{xblock_str}])"
+                    )
+                    return [str(left_flat), str(right_flat)]
+
+                # n > 2: reshape to [XBLOCK, n/2, 2] and split
+                half = n // 2
+                shape_3d = (xblock_str, str(half), "2")
+                reshaped = self.cse.newvar(dtype=var_dtype, shape=shape_3d)
+                buffer.writeline(
+                    f"{reshaped} = tl.reshape({var_name}, [{xblock_str}, {half}, 2])"
+                )
+                shape_split = (xblock_str, str(half), "1")
+                left = self.cse.newvar(dtype=var_dtype, shape=shape_split)
+                right = self.cse.newvar(dtype=var_dtype, shape=shape_split)
+                buffer.writeline(f"{left}, {right} = tl.split({reshaped})")
+
+                # Reshape to [XBLOCK, half]
+                shape_2d = (xblock_str, str(half))
+                left_flat = self.cse.newvar(dtype=var_dtype, shape=shape_2d)
+                right_flat = self.cse.newvar(dtype=var_dtype, shape=shape_2d)
+                buffer.writeline(
+                    f"{left_flat} = tl.reshape({left}, [{xblock_str}, {half}])"
+                )
+                buffer.writeline(
+                    f"{right_flat} = tl.reshape({right}, [{xblock_str}, {half}])"
+                )
+
+                # Recursively extract
+                left_elems = extract_elements(str(left_flat), half, var_dtype)
+                right_elems = extract_elements(str(right_flat), half, var_dtype)
+
+                # Interleave: left has evens, right has odds
+                result = []
+                for i in range(half):
+                    result.append(left_elems[i])  # element 2*i
+                    result.append(right_elems[i])  # element 2*i+1
+                return result
+
+            # Extract all elements from both a and b
+            all_a_elements = extract_elements(str(a_value), total_elements, a_value.dtype)
+            all_b_elements = extract_elements(str(b_value), total_elements, b_value.dtype)
+
+            # Generate FMA chains for each group
+            group_results = []
+            for g in range(num_groups):
+                group_start = g * group_size
+
+                # First element: a[e0] * b[e0]
+                first_idx = inner_element_order[0]
+                abs_first = group_start + first_idx
+                acc_var = self.cse.newvar(dtype=a_value.dtype, shape=reduced_shape)
+                buffer.writeline(
+                    f"{acc_var} = {all_a_elements[abs_first]} * {all_b_elements[abs_first]}"
+                )
+
+                # FMA chain for remaining elements: fma(a[ei], b[ei], acc)
+                for idx in inner_element_order[1:]:
+                    abs_idx = group_start + idx
+                    new_acc = self.cse.newvar(dtype=a_value.dtype, shape=reduced_shape)
+                    # Use libdevice.fma for precise FMA
+                    buffer.writeline(
+                        f"{new_acc} = tl.extra.cuda.libdevice.fma("
+                        f"{all_a_elements[abs_idx]}, {all_b_elements[abs_idx]}, {acc_var})"
+                    )
+                    acc_var = str(new_acc)
+
+                group_results.append(acc_var)
+
+            # Combine group results with regular addition tree
+            result_var = group_results[0]
+            for g in range(1, num_groups):
+                new_result = self.cse.newvar(dtype=a_value.dtype, shape=reduced_shape)
+                buffer.writeline(f"{new_result} = {result_var} + {group_results[g]}")
+                result_var = str(new_result)
+
+            # Final result
+            result, shape = self.reduction_resize_and_shape(result_var, a_value.shape)
+
+            return result, shape
+
         def ordered_final_reduction_define(
             buffer,
             result_var: CSEVariable,
@@ -4316,6 +4502,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 # Don't generate mask value for online_softmax since we
                 # will fallback below
                 masked_value = None
+            elif reduction_type == "ordered_dot":
+                # ordered_dot has tuple value (a, b) but scalar default 0
+                # Mask each element of the tuple with the same default
+                assert isinstance(value, tuple) and len(value) == 2
+                masked_value = [_mask_value(v, default) for v in value]
             elif isinstance(value, tuple):
                 masked_value = [_mask_value(v, d) for v, d in zip(value, default)]  # type: ignore[arg-type]
             elif reduction_type == "dot":
@@ -4370,6 +4561,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 # All data is loaded to register anyway, no need to do
                 # online softmax
                 result_var = self.prepare_softmax_twopass_fallback(dtype, value)
+            elif reduction_type == "ordered_dot":
+                # ordered_dot has tuple value (a, b) for FMA reduction
+                assert isinstance(masked_value, (list, tuple)) and len(masked_value) == 2
+                _result, _dtype, _shape = ordered_final_reduction(
+                    self.compute, tuple(masked_value), masked_value[0].dtype
+                )
+                result_var = self.cse.generate(
+                    self.compute, _result, dtype=_dtype, shape=_shape
+                )
             else:
                 assert isinstance(masked_value, CSEVariable)
                 if ordered:
