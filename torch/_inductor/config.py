@@ -828,6 +828,14 @@ ordered_reduction_chunk_size = int(
     os.environ.get("TORCHINDUCTOR_ORDERED_REDUCTION_CHUNK", "1024")
 )
 
+# Maximum number of chunks for looped ordered reduction.
+# When an ordered reduction has more chunks than this, it falls back to split reduction
+# (multiple kernels with global memory intermediate). Looped mode keeps chunk results
+# in registers within a single kernel, so this limit prevents register pressure issues.
+looped_ordered_reduction_max_chunks = int(
+    os.environ.get("TORCHINDUCTOR_LOOPED_ORDERED_REDUCTION_MAX_CHUNKS", "16")
+)
+
 # When we do split reduction, this number control the minimum value for
 # num_split. Too small num_split make the split reduction less efficient.
 # It's a much bigger problem when we compile a dynamic shape kernel with

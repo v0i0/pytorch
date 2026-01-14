@@ -3977,9 +3977,35 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 if not is_nested_order(decoded_order):
                     # Flat tuple = tree reduction with stride-based splitting
                     # Example: (4, 2, 1) for 8 elements
-                    result, shape = _generate_tree_reduction(
-                        buffer, value, decoded_order
+
+                    # Check if we should use looped mode for large reductions
+                    flat_strides = flatten_order(decoded_order)
+                    total_size = 1 << len(flat_strides)  # 2^num_strides
+                    chunk_size = config.ordered_reduction_chunk_size
+                    num_chunks = (total_size + chunk_size - 1) // chunk_size
+                    max_chunks = config.looped_ordered_reduction_max_chunks
+
+                    # Use looped mode if:
+                    # 1. More than one chunk needed
+                    # 2. Number of chunks within limit
+                    # 3. num_chunks is power of 2 (for clean tree structure)
+                    # 4. dtype is fp16/bf16 (looped mode has overhead that hurts fp32)
+                    is_half_precision = dtype in (torch.float16, torch.bfloat16)
+                    use_looped = (
+                        num_chunks > 1
+                        and num_chunks <= max_chunks
+                        and (num_chunks & (num_chunks - 1)) == 0  # power of 2
+                        and is_half_precision  # Only beneficial for half precision
                     )
+
+                    if use_looped:
+                        result, shape = _generate_looped_ordered_reduction(
+                            buffer, value, decoded_order, chunk_size, total_size
+                        )
+                    else:
+                        result, shape = _generate_tree_reduction(
+                            buffer, value, decoded_order
+                        )
                 else:
                     # Nested tuple = hierarchical with linear within groups
                     # Example: ((4, 2), 1) for 8 elements
@@ -4420,6 +4446,229 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             result, shape = self.reduction_resize_and_shape(result_var, a_value.shape)
 
             return result, shape
+
+        def _generate_variable_tree_reduction(
+            buffer,
+            variables: list[str],
+            across_order: tuple,
+            var_dtype,
+            var_shape,
+        ) -> str:
+            """
+            Generate tree reduction across register variables using across_order.
+
+            For variables [c0, c1, c2, c3, c4, c5, c6, c7] and across_order (4, 2, 1):
+            - Level 1 (stride 4): t0=c0+c4, t1=c1+c5, t2=c2+c6, t3=c3+c7
+            - Level 2 (stride 2): u0=t0+t2, u1=t1+t3
+            - Level 3 (stride 1): result=u0+u1
+
+            The across_order strides determine which variables to pair at each level.
+            """
+            from torch._inductor.runtime.triton_helpers import flatten_order
+
+            flat_strides = flatten_order(across_order)
+            current_vars = list(variables)
+
+            for stride in flat_strides:
+                new_vars: list[str] = []
+                # Pair element i with element i+stride for i in [0, stride)
+                for i in range(stride):
+                    if i + stride < len(current_vars):
+                        new_var = self.cse.newvar(dtype=var_dtype, shape=var_shape)
+                        buffer.writeline(
+                            f"{new_var} = {current_vars[i]} + {current_vars[i + stride]}"
+                        )
+                        new_vars.append(str(new_var))
+                    else:
+                        # No pair available, carry forward
+                        new_vars.append(current_vars[i])
+                current_vars = new_vars
+
+            return current_vars[0]
+
+        def _generate_looped_ordered_reduction(
+            buffer,
+            value: CSEVariable,
+            reduction_order: tuple,
+            chunk_size: int,
+            total_size: int,
+        ) -> tuple[str, BlockShapeType]:
+            """
+            Generate looped ordered reduction with unrolled chunks in registers.
+
+            For 8192 elements with order=(4096, 2048, 1024, 512, ..., 1),
+            chunk_size=1024, num_chunks=8:
+
+            1. Reshape input [XBLOCK, 8192] -> [XBLOCK, 8, 1024]
+            2. For each chunk: extract, tree-reduce with within_order
+            3. Tree-reduce chunk results with across_order
+
+            This keeps all intermediate results in registers, avoiding global memory.
+            """
+            from torch._inductor.runtime.triton_helpers import (
+                flatten_order,
+                partition_order_for_chunk,
+            )
+
+            # Partition order into within-chunk and across-chunk
+            within_order, across_order = partition_order_for_chunk(
+                reduction_order, chunk_size
+            )
+
+            num_chunks = (total_size + chunk_size - 1) // chunk_size
+
+            # Get shape info
+            if value.shape:
+                xblock = value.shape[0]
+            else:
+                xblock = "XBLOCK"
+
+            reduced_shape = (xblock,)
+
+            # Reshape input to [XBLOCK, num_chunks, chunk_size]
+            reshaped_var = self.cse.newvar(
+                dtype=value.dtype, shape=(xblock, num_chunks, chunk_size)
+            )
+            buffer.writeline(
+                f"{reshaped_var} = tl.reshape({value}, [{xblock}, {num_chunks}, {chunk_size}])"
+            )
+
+            # Extract chunks using transpose + split
+            # tl.split splits on the LAST dimension, so we transpose to put num_chunks last
+            def extract_chunks(var_name: str, n_chunks: int, c_size: int) -> list[str]:
+                """Extract n_chunks chunks from var [XBLOCK, n_chunks, c_size]."""
+                if n_chunks == 1:
+                    extracted = self.cse.newvar(
+                        dtype=value.dtype, shape=(xblock, c_size)
+                    )
+                    buffer.writeline(
+                        f"{extracted} = tl.reshape({var_name}, [{xblock}, {c_size}])"
+                    )
+                    return [str(extracted)]
+
+                if n_chunks == 2:
+                    # Transpose [XBLOCK, 2, c_size] -> [XBLOCK, c_size, 2]
+                    permuted = self.cse.newvar(
+                        dtype=value.dtype, shape=(xblock, c_size, 2)
+                    )
+                    buffer.writeline(
+                        f"{permuted} = tl.trans({var_name}, 0, 2, 1)"
+                    )
+                    # Split on last dim
+                    left = self.cse.newvar(
+                        dtype=value.dtype, shape=(xblock, c_size, 1)
+                    )
+                    right = self.cse.newvar(
+                        dtype=value.dtype, shape=(xblock, c_size, 1)
+                    )
+                    buffer.writeline(f"{left}, {right} = tl.split({permuted})")
+                    # Reshape to [XBLOCK, c_size]
+                    left_flat = self.cse.newvar(
+                        dtype=value.dtype, shape=(xblock, c_size)
+                    )
+                    right_flat = self.cse.newvar(
+                        dtype=value.dtype, shape=(xblock, c_size)
+                    )
+                    buffer.writeline(
+                        f"{left_flat} = tl.reshape({left}, [{xblock}, {c_size}])"
+                    )
+                    buffer.writeline(
+                        f"{right_flat} = tl.reshape({right}, [{xblock}, {c_size}])"
+                    )
+                    return [str(left_flat), str(right_flat)]
+
+                # n_chunks > 2: recursively split in half
+                half = n_chunks // 2
+                if n_chunks % 2 != 0:
+                    raise RuntimeError(
+                        f"Looped ordered reduction requires power-of-2 num_chunks, got {n_chunks}"
+                    )
+
+                # Reshape [XBLOCK, n_chunks, c_size] -> [XBLOCK, 2, half, c_size]
+                reshaped = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, 2, half, c_size)
+                )
+                buffer.writeline(
+                    f"{reshaped} = tl.reshape({var_name}, [{xblock}, 2, {half}, {c_size}])"
+                )
+                # Transpose to [XBLOCK, half, c_size, 2]
+                permuted = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, half, c_size, 2)
+                )
+                buffer.writeline(
+                    f"{permuted} = tl.trans({reshaped}, 0, 2, 3, 1)"
+                )
+                # Split on last dim
+                left = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, half, c_size, 1)
+                )
+                right = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, half, c_size, 1)
+                )
+                buffer.writeline(f"{left}, {right} = tl.split({permuted})")
+                # Reshape to [XBLOCK, half, c_size]
+                left_flat = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, half, c_size)
+                )
+                right_flat = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, half, c_size)
+                )
+                buffer.writeline(
+                    f"{left_flat} = tl.reshape({left}, [{xblock}, {half}, {c_size}])"
+                )
+                buffer.writeline(
+                    f"{right_flat} = tl.reshape({right}, [{xblock}, {half}, {c_size}])"
+                )
+
+                # Recursively extract from each half
+                left_chunks = extract_chunks(str(left_flat), half, c_size)
+                right_chunks = extract_chunks(str(right_flat), half, c_size)
+
+                # First half chunks, then second half
+                return left_chunks + right_chunks
+
+            all_chunks = extract_chunks(str(reshaped_var), num_chunks, chunk_size)
+
+            # Tree-reduce each chunk using within_order
+            chunk_results = []
+            for chunk_idx, chunk_var in enumerate(all_chunks):
+                # Create CSEVariable for the chunk
+                chunk_cse = self.cse.newvar(
+                    dtype=value.dtype, shape=(xblock, chunk_size)
+                )
+                buffer.writeline(f"{chunk_cse} = {chunk_var}")
+
+                # Apply tree reduction with within_order
+                chunk_result, _ = _generate_tree_reduction(
+                    buffer, chunk_cse, tuple(within_order)
+                )
+                chunk_results.append(chunk_result)
+
+            # Tree-reduce across chunk results using across_order
+            if len(across_order) > 0:
+                result_var = _generate_variable_tree_reduction(
+                    buffer, chunk_results, tuple(across_order), value.dtype, reduced_shape
+                )
+            else:
+                # Only one chunk, result is already computed
+                result_var = chunk_results[0]
+
+            # Add trailing dimensions for proper broadcasting
+            ndims = self.triton_tensor_ndim()
+            nreduce = self.num_reduction_dims
+            if ndims > 1 and nreduce > 0:
+                shape_parts = [str(xblock)] + ["1"] * nreduce
+                shape_str = "[" + ", ".join(shape_parts) + "]"
+                final_shape_tuple = (xblock,) + (1,) * nreduce
+                final_var = self.cse.newvar(
+                    dtype=value.dtype, shape=final_shape_tuple
+                )
+                buffer.writeline(
+                    f"{final_var} = tl.reshape({result_var}, {shape_str})"
+                )
+                return str(final_var), final_shape_tuple
+            else:
+                return result_var, reduced_shape
 
         def ordered_final_reduction_define(
             buffer,

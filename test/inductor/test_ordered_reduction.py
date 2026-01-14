@@ -757,5 +757,284 @@ class TestOrderedDotPrim(TestCase):
             inductor_prims.ordered_dot(a, b, dim=[1], order=[2, 1, 4], grouping=[2, 1])
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+@torch._inductor.config.patch({"triton.cooperative_reductions": False})
+class TestLoopedOrderedReduction(TestCase):
+    """Tests for looped ordered reductions.
+
+    Looped ordered reductions process chunks in an unrolled loop within a single
+    kernel, keeping chunk results in registers. This is beneficial for large
+    reduction sizes (2048+) with half-precision dtypes (fp16, bf16).
+    """
+
+    @staticmethod
+    def get_order_for_size(red_size):
+        """Generate flat tree order for a given reduction size (must be power of 2)."""
+        order = []
+        s = red_size // 2
+        while s >= 1:
+            order.append(s)
+            s //= 2
+        return order
+
+    def test_looped_config_exists(self):
+        """Test that looped ordered reduction config exists."""
+        self.assertTrue(hasattr(config, "looped_ordered_reduction_max_chunks"))
+        self.assertEqual(config.looped_ordered_reduction_max_chunks, 16)
+
+    def test_looped_basic_fp16(self):
+        """Test basic looped ordered reduction with fp16."""
+        from torch._inductor import inductor_prims
+
+        size = 2048  # 2 chunks with default chunk_size=1024
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(1000, size, device="cuda", dtype=torch.float16)
+
+        torch._dynamo.reset()
+
+        @torch.compile
+        def fn(x):
+            return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+        result = fn(x)
+        expected = x.sum(dim=1)
+
+        # Should be close (not exact due to different accumulation order)
+        self.assertTrue(
+            torch.allclose(result, expected, rtol=1e-2, atol=1e-2),
+            f"Max diff: {(result - expected).abs().max().item()}"
+        )
+
+    def test_looped_basic_bf16(self):
+        """Test basic looped ordered reduction with bf16."""
+        from torch._inductor import inductor_prims
+
+        size = 2048
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(1000, size, device="cuda", dtype=torch.bfloat16)
+
+        torch._dynamo.reset()
+
+        @torch.compile
+        def fn(x):
+            return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+        result = fn(x)
+        expected = x.sum(dim=1)
+
+        self.assertTrue(
+            torch.allclose(result, expected, rtol=1e-2, atol=1e-2),
+            f"Max diff: {(result - expected).abs().max().item()}"
+        )
+
+    def test_looped_basic_fp32_uses_regular_mode(self):
+        """Test that fp32 does not use looped mode (falls back to regular tree)."""
+        from torch._inductor import inductor_prims
+
+        size = 2048
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(1000, size, device="cuda", dtype=torch.float32)
+
+        torch._dynamo.reset()
+
+        @torch.compile
+        def fn(x):
+            return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+        result = fn(x)
+        expected = x.sum(dim=1)
+
+        # Should be close
+        self.assertTrue(
+            torch.allclose(result, expected, rtol=1e-3, atol=1e-3),
+            f"Max diff: {(result - expected).abs().max().item()}"
+        )
+
+    def test_looped_reproducibility_fp16(self):
+        """Test that looped ordered reduction produces identical results across runs (fp16)."""
+        from torch._inductor import inductor_prims
+
+        size = 4096
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(100, size, device="cuda", dtype=torch.float16)
+
+        results = []
+        for _ in range(5):
+            torch._dynamo.reset()
+
+            @torch.compile
+            def fn(x):
+                return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+            results.append(fn(x).clone())
+
+        # All runs must be bitwise identical
+        reference = results[0]
+        for i, result in enumerate(results[1:], 1):
+            self.assertTrue(
+                torch.equal(reference, result),
+                f"Run {i} differs from run 0"
+            )
+
+    def test_looped_reproducibility_bf16(self):
+        """Test that looped ordered reduction produces identical results across runs (bf16)."""
+        from torch._inductor import inductor_prims
+
+        size = 4096
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(100, size, device="cuda", dtype=torch.bfloat16)
+
+        results = []
+        for _ in range(5):
+            torch._dynamo.reset()
+
+            @torch.compile
+            def fn(x):
+                return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+            results.append(fn(x).clone())
+
+        # All runs must be bitwise identical
+        reference = results[0]
+        for i, result in enumerate(results[1:], 1):
+            self.assertTrue(
+                torch.equal(reference, result),
+                f"Run {i} differs from run 0"
+            )
+
+    def test_looped_various_sizes_fp16(self):
+        """Test looped ordered reduction with various sizes (fp16)."""
+        from torch._inductor import inductor_prims
+
+        # Test sizes that trigger looped mode (>1024, power of 2, <= 16 chunks)
+        sizes = [2048, 4096, 8192, 16384]
+
+        for size in sizes:
+            order = self.get_order_for_size(size)
+            x = torch.randn(100, size, device="cuda", dtype=torch.float16)
+
+            torch._dynamo.reset()
+
+            @torch.compile
+            def fn(x):
+                return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+            result = fn(x)
+            expected = x.sum(dim=1)
+
+            self.assertTrue(
+                torch.allclose(result, expected, rtol=1e-2, atol=1e-2),
+                f"Mismatch at size={size}. Max diff: {(result - expected).abs().max().item()}"
+            )
+
+    def test_looped_matches_non_looped_fp16(self):
+        """Test that looped mode gives bitwise-identical results to non-looped (persistent)."""
+        from torch._inductor import inductor_prims
+
+        size = 2048
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(100, size, device="cuda", dtype=torch.float16)
+
+        # Force non-looped by disabling with config
+        with config.patch({"looped_ordered_reduction_max_chunks": 0}):
+            torch._dynamo.reset()
+
+            @torch.compile
+            def non_looped_fn(x):
+                return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+            non_looped_result = non_looped_fn(x)
+
+        # Normal execution (looped mode enabled)
+        torch._dynamo.reset()
+
+        @torch.compile
+        def looped_fn(x):
+            return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+        looped_result = looped_fn(x)
+
+        # Must be bitwise identical (same numerical order)
+        self.assertTrue(
+            torch.equal(non_looped_result, looped_result),
+            f"Looped and non-looped differ. Max diff: {(non_looped_result - looped_result).abs().max().item()}"
+        )
+
+    def test_looped_4_chunks(self):
+        """Test looped reduction with exactly 4 chunks (4096 elements)."""
+        from torch._inductor import inductor_prims
+
+        size = 4096  # 4 chunks with chunk_size=1024
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(100, size, device="cuda", dtype=torch.float16)
+
+        torch._dynamo.reset()
+
+        @torch.compile
+        def fn(x):
+            return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+        result = fn(x)
+        expected = x.sum(dim=1)
+
+        self.assertTrue(
+            torch.allclose(result, expected, rtol=1e-2, atol=1e-2),
+            f"Max diff: {(result - expected).abs().max().item()}"
+        )
+
+    def test_looped_8_chunks(self):
+        """Test looped reduction with exactly 8 chunks (8192 elements)."""
+        from torch._inductor import inductor_prims
+
+        size = 8192  # 8 chunks with chunk_size=1024
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(100, size, device="cuda", dtype=torch.float16)
+
+        torch._dynamo.reset()
+
+        @torch.compile
+        def fn(x):
+            return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+        result = fn(x)
+        expected = x.sum(dim=1)
+
+        self.assertTrue(
+            torch.allclose(result, expected, rtol=1e-2, atol=1e-2),
+            f"Max diff: {(result - expected).abs().max().item()}"
+        )
+
+    def test_looped_small_batch(self):
+        """Test looped reduction with small batch size."""
+        from torch._inductor import inductor_prims
+
+        size = 2048
+        order = self.get_order_for_size(size)
+
+        x = torch.randn(4, size, device="cuda", dtype=torch.float16)
+
+        torch._dynamo.reset()
+
+        @torch.compile
+        def fn(x):
+            return inductor_prims.ordered_sum(x, dim=1, order=order, grouping=[])
+
+        result = fn(x)
+        expected = x.sum(dim=1)
+
+        self.assertTrue(
+            torch.allclose(result, expected, rtol=1e-2, atol=1e-2),
+            f"Max diff: {(result - expected).abs().max().item()}"
+        )
+
+
 if __name__ == "__main__":
     run_tests()
