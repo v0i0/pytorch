@@ -2273,10 +2273,12 @@ class TestSoftMax(TestCase):
                 t = torch.tensor(float(tmp[j]), device="cuda", dtype=torch.float32)
                 ov = torch.tensor(float(o[j]), device="cuda", dtype=torch.float32)
                 spec_gi.append(_compiled_softmax_backward_epilogue(t, ov, sum_t).item())
+            # 97% bitwise; remaining 3% have sub-ULP diffs (~1e-11) from
+            # ~2 ULP sum divergence in kernel's AddFloat ilpReduce.
             self.assertEqual(
                 torch.tensor(np.array(spec_gi, dtype=np.float32)),
                 result[i].cpu(),
-                atol=1e-6, rtol=0,
+                atol=2e-11, rtol=0,
             )
 
     def test_softmax_backward_spatial(self):
@@ -2377,10 +2379,11 @@ class TestSoftMax(TestCase):
                                      dtype=torch.float32).exp()
                 g_t = torch.tensor(float(g[j]), device="cuda", dtype=torch.float32)
                 spec_gi.append(_compiled_softmax_backward_epilogue(g_t, exp_o, sum_t).item())
+            # exp(log_softmax_output) introduces ~1 ULP per element + sum divergence.
             self.assertEqual(
                 torch.tensor(np.array(spec_gi, dtype=np.float32)),
                 result[i].cpu(),
-                atol=1e-6, rtol=0,
+                atol=3e-7, rtol=0,
             )
 
     def test_softmax_backward_persistent(self):
