@@ -220,6 +220,39 @@ def block_reduce_cuh(thread_values: list, combine: Combine, identity,
     return shfl_down_reduce_high_to_low(warp_results[:warp_size], combine)
 
 
+# CUDA ref: cuda/SoftMax.cu:412 (blockReduce)
+def softmax_block_reduce(thread_values: list, combine: Combine, identity,
+                         warp_size: int = 32):
+    """Shared-memory sequential reduce from SoftMax.cu (NOT shfl_down).
+    Level 1: first-warp lane l sequentially sums smem[l*32..l*32+31].
+    Level 2: thread 0 sequentially sums per-warp results."""
+    n = len(thread_values)
+    num_warps = n // warp_size
+    warp_results = [identity] * num_warps
+    for lane in range(min(warp_size, num_warps)):
+        val = identity
+        for i in range(warp_size):
+            val = combine(val, thread_values[lane * warp_size + i])
+        warp_results[lane] = val
+    result = identity
+    for i in range(num_warps):
+        result = combine(result, warp_results[i])
+    return result
+
+
+# CUDA ref: cuda/SoftMax.cu:163 (SoftMax_getBlockSize)
+def softmax_getblocksize(ILP: int, dim_size: int, max_threads: int = 1024,
+                         warp_size: int = 32) -> int:
+    """Block size for cunn_SoftMaxBackward."""
+    max_block_size = min(dim_size // ILP, max_threads)
+    if ILP > 1:
+        max_block_size //= 2
+    block_size = 1
+    while block_size < max_block_size:
+        block_size *= 2
+    return max(block_size, warp_size)
+
+
 # CUDA ref: cuda/MultiMarginLoss.cu:24
 def thread_0_serial_scan(values: list, combine: Combine, identity):
     """Thread 0 serial scan — used by MultiMarginLoss."""
@@ -3857,13 +3890,14 @@ class TestSoftMax(TestCase):
         # aten::_softmax_backward_data — same inner/spatial dispatch.
         # Computes sum(grad * output) using same tree as forward sum.
         # Use dim=50000 to bypass Smem variant (same as forward inner test).
+        # Block reduce uses SoftMax.cu's sequential blockReduce (NOT shfl_down).
         x = torch.randn(2, 50000, device="cuda")
         output = torch.softmax(x, dim=-1)
         grad = torch.randn_like(output)
         result = torch.ops.aten._softmax_backward_data(grad, output, -1, x.dtype)
         self.assertEqual(result.shape, x.shape)
-        B = 1024
         ILP = 4
+        B = softmax_getblocksize(ILP, x.shape[-1])
         for i in range(x.shape[0]):
             g = grad[i].cpu().tolist()
             o = output[i].cpu().tolist()
@@ -3887,20 +3921,18 @@ class TestSoftMax(TestCase):
                     acc = cast(acc + tmp[tail_offset])
                     tail_offset += B
                 thread_sums[tid] = acc
-            row_sum = block_reduce_cuh(thread_sums, lambda a, b: cast(a + b), zero)
-            # Compiled epilogue for FMA: tmp - output * sum
+            row_sum = softmax_block_reduce(
+                thread_sums, lambda a, b: cast(a + b), zero)
             sum_t = torch.tensor(float(row_sum), device="cuda", dtype=torch.float32)
             spec_gi = []
             for j in range(n):
                 t = torch.tensor(float(tmp[j]), device="cuda", dtype=torch.float32)
                 ov = torch.tensor(float(o[j]), device="cuda", dtype=torch.float32)
                 spec_gi.append(_compiled_softmax_backward_epilogue(t, ov, sum_t).item())
-            # 97% bitwise; remaining 3% have sub-ULP diffs (~1e-11) from
-            # ~2 ULP sum divergence in kernel's AddFloat ilpReduce.
             self.assertEqual(
                 torch.tensor(spec_gi, dtype=torch.float32),
                 result[i].cpu(),
-                atol=2e-11, rtol=0,
+                atol=0, rtol=0,
             )
 
     def test_softmax_backward_spatial(self):
@@ -3957,7 +3989,7 @@ class TestSoftMax(TestCase):
 
     def test_log_softmax_backward(self):
         # log_softmax backward: grad_input = grad - exp(output) * sum(grad)
-        # Same ilpReduce + BlockReduceSum tree as softmax backward inner.
+        # Same ilpReduce + SoftMax.cu sequential blockReduce as softmax backward.
         # Use dim=50000 to bypass Smem variant.
         x = torch.randn(4, 50000, device="cuda")
         output = torch.log_softmax(x, dim=-1)
@@ -3966,12 +3998,10 @@ class TestSoftMax(TestCase):
             grad, output, -1, x.dtype
         )
         self.assertEqual(result.shape, x.shape)
-        exp = _dtype_exp(torch.float32)
-        B = 1024
         ILP = 4
+        B = softmax_getblocksize(ILP, x.shape[-1])
         for i in range(x.shape[0]):
             g = grad[i].cpu().tolist()
-            o = output[i].cpu().tolist()
             n = len(g)
             cast = _f32
             zero = cast(0.0)
@@ -3991,21 +4021,22 @@ class TestSoftMax(TestCase):
                     acc = cast(acc + g[tail_offset])
                     tail_offset += B
                 thread_sums[tid] = acc
-            row_sum = block_reduce_cuh(thread_sums, lambda a, b: cast(a + b), zero)
+            row_sum = softmax_block_reduce(
+                thread_sums, lambda a, b: cast(a + b), zero)
             # Epilogue: grad - exp(output) * sum(grad)
-            # exp(log_softmax_output) is computed via CUDA exp
+            # exp(output) computed on CUDA to match kernel's inline std::exp
+            exp_output = output[i].exp()
             sum_t = torch.tensor(float(row_sum), device="cuda", dtype=torch.float32)
             spec_gi = []
             for j in range(n):
-                exp_o = torch.tensor(float(o[j]), device="cuda",
-                                     dtype=torch.float32).exp()
+                exp_o = torch.tensor(float(exp_output[j].item()), device="cuda",
+                                     dtype=torch.float32)
                 g_t = torch.tensor(float(g[j]), device="cuda", dtype=torch.float32)
                 spec_gi.append(_compiled_softmax_backward_epilogue(g_t, exp_o, sum_t).item())
-            # exp(log_softmax_output) introduces ~1 ULP per element + sum divergence.
             self.assertEqual(
                 torch.tensor(spec_gi, dtype=torch.float32),
                 result[i].cpu(),
-                atol=3e-7, rtol=0,
+                atol=0, rtol=0,
             )
 
     def test_softmax_backward_persistent(self):
