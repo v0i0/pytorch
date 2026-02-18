@@ -1566,8 +1566,9 @@ def spec_rms_norm_backward_dgamma(dY_rows: list, X_rows: list,
 
 def _ln_bwd_per_thread_stats(dY_cuda, X_cuda, gamma_cuda, mean_val, rstd_val,
                               tid, block_size, N):
-    """Per-thread stats using _fma_f32 to match nvcc FMA contractions.
-    Vectorized: 4 consecutive elements per iteration at stride blockDim.x*4.
+    """Per-thread stats matching nvcc FMA contractions + CSE.
+    nvcc applies CSE on c_loss*gamma_val (shared between stats_x1 and stats_x2),
+    so stats_x1 uses plain add (not FMA), and stats_x2 reuses the rounded product.
 
     CUDA ref: layer_norm_kernel.cu:496-531."""
     mi = float(mean_val.item())
@@ -1580,15 +1581,17 @@ def _ln_bwd_per_thread_stats(dY_cuda, X_cuda, gamma_cuda, mean_val, rstd_val,
             cl = float(dY_cuda[l + k].item())
             gv = float(gamma_cuda[l + k].item())
             ch = float(X_cuda[l + k].item())
-            s1 = _fma_f32(cl, gv, s1)
-            s2 = _fma_f32(_f32(_f32(cl * gv) * _f32(ch - mi)), ri, s2)
+            t = _f32(cl * gv)
+            s1 = _f32(s1 + t)
+            s2 = _fma_f32(_f32(t * _f32(ch - mi)), ri, s2)
         l += block_size * 4
     while l < N:
         cl = float(dY_cuda[l].item())
         gv = float(gamma_cuda[l].item())
         ch = float(X_cuda[l].item())
-        s1 = _fma_f32(cl, gv, s1)
-        s2 = _fma_f32(_f32(_f32(cl * gv) * _f32(ch - mi)), ri, s2)
+        t = _f32(cl * gv)
+        s1 = _f32(s1 + t)
+        s2 = _fma_f32(_f32(t * _f32(ch - mi)), ri, s2)
         l += 1
     return s1, s2
 
@@ -1620,11 +1623,7 @@ def _rms_bwd_per_thread_stats(dY_cuda, X_cuda, gamma_cuda, rstd_val,
 def spec_layer_norm_backward_dx_compiled(
         dY_cuda, X_cuda, mean_val, rstd_val, gamma_cuda,
         block_size: int = 128):
-    """Layer norm backward dX with _fma_f32 stats + FMA elementwise.
-
-    Per-thread stats: s1 = fma(c_loss, gamma, s1); s2 = fma(dYg*(X-mean), rstd, s2)
-    Elementwise: f_grad = fma(fH*gamma, dY, -(x-mean)*rstd*sx2)
-    Results are Python float64; torch.tensor() rounds to float32 matching CUDA.
+    """Layer norm backward dX with FMA-precise stats + elementwise.
 
     block_size: num_threads() = C10_WARP_SIZE * 4 = 128 on CUDA.
     CUDA ref: layer_norm_kernel.cu:464 (vectorized), :357 (compute_gI)."""
@@ -1633,27 +1632,45 @@ def spec_layer_norm_backward_dx_compiled(
 
     thread_x1, thread_x2 = [], []
     for tid in range(block_size):
-        s1, s2 = _compiled_ln_bwd_stats(
+        s1, s2 = _ln_bwd_per_thread_stats(
             dY_cuda, X_cuda, gamma_cuda, mean_val, rstd_val,
-            tid, block_size)
-        thread_x1.append(_f32(s1.item()))
-        thread_x2.append(_f32(s2.item()))
+            tid, block_size, N)
+        thread_x1.append(s1)
+        thread_x2.append(s2)
 
     stats_x1 = block_reduce_cuh(thread_x1, add, 0.0)
     stats_x2 = block_reduce_cuh(thread_x2, add, 0.0)
 
-    sx1_t = torch.tensor(stats_x1, device=dY_cuda.device, dtype=dY_cuda.dtype)
-    sx2_t = torch.tensor(stats_x2, device=dY_cuda.device, dtype=dY_cuda.dtype)
-    fH_t = torch.tensor(float(N), device=dY_cuda.device, dtype=dY_cuda.dtype)
-    dx = _compiled_ln_dx_elementwise(
-        dY_cuda, X_cuda, gamma_cuda, mean_val, rstd_val,
-        sx1_t, sx2_t, fH_t)
-    return dx.cpu().tolist()
+    # Elementwise dX: nvcc cross-statement FMA contraction merges
+    # the `*dy` from line 1 with the `-=` from line 2 into a single FMA.
+    #   t1 = fH * gamma                                       [mul]
+    #   t2 = ((x - mean) * rstd) * stats_x2                   [sub, two muls]
+    #   f_grad = fma(t1, dY, -t2)                              [FMA]
+    #   f_grad = f_grad - stats_x1                             [sub]
+    #   f_grad = f_grad * term1                                [mul]
+    mi = float(mean_val.item())
+    ri = float(rstd_val.item())
+    sx1 = float(stats_x1)
+    sx2 = float(stats_x2)
+    fH = _f32(float(N))
+    term1 = _f32(_f32(1.0 / fH) * ri)
+    dx = []
+    for i in range(N):
+        dy = float(dY_cuda[i].item())
+        gv = float(gamma_cuda[i].item())
+        x = float(X_cuda[i].item())
+        t1 = _f32(fH * gv)
+        t2 = _f32(_f32(_f32(x - mi) * ri) * sx2)
+        f_grad = _fma_f32(t1, dy, -t2)
+        f_grad = _f32(f_grad - sx1)
+        f_grad = _f32(f_grad * term1)
+        dx.append(f_grad)
+    return dx
 
 
 def spec_rms_norm_backward_dx_compiled(
         dY_cuda, X_cuda, rstd_val, gamma_cuda, block_size: int = 128):
-    """RMS norm backward dX with compiled stats + compiled elementwise.
+    """RMS norm backward dX with FMA-precise stats + elementwise.
 
     CUDA ref: layer_norm_kernel.cu:464 (vectorized, rms_norm=true)."""
     N = dY_cuda.shape[0]
@@ -1661,17 +1678,33 @@ def spec_rms_norm_backward_dx_compiled(
 
     thread_x2 = []
     for tid in range(block_size):
-        s2 = _compiled_rms_bwd_stats(
-            dY_cuda, X_cuda, gamma_cuda, rstd_val, tid, block_size)
-        thread_x2.append(_f32(s2.item()))
+        s2 = _rms_bwd_per_thread_stats(
+            dY_cuda, X_cuda, gamma_cuda, rstd_val, tid, block_size, N)
+        thread_x2.append(s2)
 
     stats_x2 = block_reduce_cuh(thread_x2, add, 0.0)
 
-    sx2_t = torch.tensor(stats_x2, device=dY_cuda.device, dtype=dY_cuda.dtype)
-    fH_t = torch.tensor(float(N), device=dY_cuda.device, dtype=dY_cuda.dtype)
-    dx = _compiled_rms_dx_elementwise(
-        dY_cuda, X_cuda, gamma_cuda, rstd_val, sx2_t, fH_t)
-    return dx.cpu().tolist()
+    # Elementwise dX: nvcc cross-statement FMA contraction merges
+    # the `*dy` from line 1 with the `-=` from line 2 into a single FMA.
+    #   t1 = fH * gamma                                  [mul]
+    #   t2 = (x * rstd) * stats_x2                       [two muls]
+    #   f_grad = fma(t1, dY, -t2)                         [FMA]
+    #   f_grad = f_grad * term1                           [mul]
+    ri = float(rstd_val.item())
+    sx2 = float(stats_x2)
+    fH = _f32(float(N))
+    term1 = _f32(_f32(1.0 / fH) * ri)
+    dx = []
+    for i in range(N):
+        dy = float(dY_cuda[i].item())
+        gv = float(gamma_cuda[i].item())
+        x = float(X_cuda[i].item())
+        t1 = _f32(fH * gv)
+        t2 = _f32(_f32(x * ri) * sx2)
+        f_grad = _fma_f32(t1, dy, -t2)
+        f_grad = _f32(f_grad * term1)
+        dx.append(f_grad)
+    return dx
 
 
 def spec_dgamma_compiled(dY_cuda, X_cuda, mean_cuda, rstd_cuda,
@@ -1707,7 +1740,8 @@ def spec_dgamma_compiled(dY_cuda, X_cuda, mean_cuda, rstd_cuda,
                     thread_sums[tid_y] = _fma_f32(t, rstd_val,
                                                    thread_sums[tid_y])
 
-    return shfl_xor_butterfly(thread_sums, lambda a, b: _f32(a + b))
+    # CUDA ref: layer_norm_kernel.cu:851 — delta = block_dim_y >> 1 down to 1
+    return shfl_xor_butterfly_high_to_low(thread_sums, lambda a, b: _f32(a + b))
 
 
 # ============================================================================
@@ -4184,12 +4218,10 @@ class TestLayerNormKernel(TestCase):
             grad[row_idx], x[row_idx], mean[row_idx], rstd[row_idx], w,
             block_size=128,
         )
-        # FMA gap: nvcc compiles dYg*(c_h-mean)*rstd as FMA chain that
-        # @torch.compile's Triton codegen doesn't reproduce exactly.
         self.assertEqual(
             torch.tensor(spec_dx),
             dx[row_idx].cpu(),
-            atol=1e-6, rtol=0,
+            atol=0, rtol=0,
         )
 
     def test_layer_norm_backward_dgamma_large_M(self):
@@ -4214,11 +4246,10 @@ class TestLayerNormKernel(TestCase):
                 block_dim_y=32, rows_per_block_y=256, rms_norm=False,
             )
             spec_dg.append(val)
-        # FMA gap: dY*(X-mean)*rstd chain over M=1000 rows + XOR butterfly
         self.assertEqual(
             torch.tensor(spec_dg),
             dw.cpu(),
-            atol=2e-5, rtol=0,
+            atol=0, rtol=0,
         )
 
     def test_layer_norm_backward_dgamma_small_M(self):
@@ -4293,11 +4324,10 @@ class TestLayerNormKernel(TestCase):
             grad[row_idx], x[row_idx], rstd_cuda[row_idx], w,
             block_size=128,
         )
-        # FMA gap: dY*gamma*X*rstd chain
         self.assertEqual(
             torch.tensor(spec_dx),
             dx_cuda[row_idx].cpu(),
-            atol=3e-7, rtol=0,
+            atol=0, rtol=0,
         )
 
     def test_rms_norm_backward_dgamma(self):
@@ -4319,11 +4349,10 @@ class TestLayerNormKernel(TestCase):
                 block_dim_y=32, rows_per_block_y=256, rms_norm=True,
             )
             spec_dg.append(val)
-        # FMA gap: dY*X*rstd chain over M=1000 rows + XOR butterfly
         self.assertEqual(
             torch.tensor(spec_dg),
             dw_cuda.cpu(),
-            atol=1e-5, rtol=0,
+            atol=0, rtol=0,
         )
 
 
