@@ -12,26 +12,41 @@ All CUDA file paths are relative to aten/src/ATen/native/cuda/.
 """
 
 import math
+import sys
 from typing import Any, Callable, List, Tuple
 
-import numpy as np
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
+
+torch._dynamo.config.recompile_limit = sys.maxsize
 
 
 # ============================================================================
 # Dtype-aware arithmetic helpers
 # ============================================================================
-# When dtype is set (e.g. np.float32), all spec arithmetic rounds to that
+# When dtype is set (e.g. torch.float32), all spec arithmetic rounds to that
 # precision at every step, matching the CUDA kernel's actual numerics.
 # When dtype is None, Python float64 is used (useful for tree-structure
 # verification).
 
+def _f32(x):
+    """Cast to float32 precision via CUDA round-trip."""
+    return torch.tensor(float(x), dtype=torch.float32, device="cuda").item()
+
+
+def _fma_f32(a, b, c):
+    """Fused multiply-add in float32: round(a*b + c) with single rounding.
+    Uses float64 intermediate since float64 exactly represents float32*float32."""
+    return torch.tensor(
+        float(a) * float(b) + float(c), dtype=torch.float32, device="cuda"
+    ).item()
+
+
 def _dtype_cast(dtype):
-    """Return a cast function for the given numpy dtype (or identity)."""
+    """Return a cast function for the given torch dtype (or identity)."""
     if dtype is None:
         return lambda x: float(x)
-    return lambda x: dtype(x)
+    return lambda x: torch.tensor(float(x), dtype=dtype, device="cuda").item()
 
 
 def _dtype_exp(dtype):
@@ -41,11 +56,9 @@ def _dtype_exp(dtype):
     # Route through CUDA torch.exp for bitwise matching with CUDA kernels.
     # IEEE 754 add/mul/div are deterministic, but transcendentals (exp, sqrt,
     # log) use different polynomial approximations on CPU vs GPU.
-    torch_dtype = {np.float32: torch.float32, np.float64: torch.float64,
-                   np.float16: torch.float16}.get(dtype, torch.float32)
     def _cuda_exp(x):
-        t = torch.tensor(float(x), dtype=torch_dtype, device="cuda")
-        return dtype(t.exp().item())
+        t = torch.tensor(float(x), dtype=dtype, device="cuda")
+        return torch.tensor(t.exp().item(), dtype=dtype, device="cuda").item()
     return _cuda_exp
 
 
@@ -53,11 +66,9 @@ def _dtype_sqrt(dtype):
     """Return sqrt() that matches CUDA's implementation for the given dtype."""
     if dtype is None:
         return math.sqrt
-    torch_dtype = {np.float32: torch.float32, np.float64: torch.float64,
-                   np.float16: torch.float16}.get(dtype, torch.float32)
     def _cuda_sqrt(x):
-        t = torch.tensor(float(x), dtype=torch_dtype, device="cuda")
-        return dtype(t.sqrt().item())
+        t = torch.tensor(float(x), dtype=dtype, device="cuda")
+        return torch.tensor(t.sqrt().item(), dtype=dtype, device="cuda").item()
     return _cuda_sqrt
 
 
@@ -65,7 +76,7 @@ def _dtype_identity(dtype, val):
     """Return val cast to dtype."""
     if dtype is None:
         return float(val)
-    return dtype(val)
+    return torch.tensor(float(val), dtype=dtype, device="cuda").item()
 
 
 # ============================================================================
@@ -638,7 +649,7 @@ def spec_softmax_persistent(row: list, warp_size: int = 32, dtype=None) -> list:
     The kernel stores exp(x-max) in registers and reuses them for output
     (PersistentSoftmax.cuh:157).  Output = stored_exp / sum.
 
-    Pass dtype=np.float32 to match fp32 CUDA numerics.
+    Pass dtype=torch.float32 to match fp32 CUDA numerics.
 
     CUDA ref: cuda/PersistentSoftmax.cuh:34 (warp_reduce), :68 (softmax_warp_forward)."""
     n = len(row)
@@ -661,17 +672,17 @@ def spec_softmax_persistent(row: list, warp_size: int = 32, dtype=None) -> list:
         for v in lv:
             e = exp(cast(v) - cast(row_max))
             lane_exp[lane_id].append(e)
-            s = s + e
+            s = cast(s + e)
         lane_sumexp.append(s)
 
-    row_sum = shfl_xor_butterfly_high_to_low(lane_sumexp, lambda a, b: a + b)
+    row_sum = shfl_xor_butterfly_high_to_low(lane_sumexp, lambda a, b: cast(a + b))
 
     output = [zero] * n
     for lane_id in range(warp_size):
         for it, e in enumerate(lane_exp[lane_id]):
             idx = lane_id + it * warp_size
             if idx < n:
-                output[idx] = e / row_sum
+                output[idx] = cast(e / row_sum)
     return output
 
 
@@ -721,12 +732,12 @@ def spec_softmax_inner(row: list, block_size: int = 1024, dtype=None) -> list:
     # SoftMaxForwardEpilogue uses exp(x-max)/sum, recomputing exp for output.
     # SumExpFloat accumulates sum(exp(x-max)) per thread.
     exp_data = [exp(cast(v) - cast(row_max)) for v in row]
-    thread_sums = ilp_reduce(exp_data, lambda a, b: a + b, zero)
-    row_sum = block_reduce_cuh(thread_sums, lambda a, b: a + b, zero)
+    thread_sums = ilp_reduce(exp_data, lambda a, b: _f32(a + b), zero)
+    row_sum = block_reduce_cuh(thread_sums, lambda a, b: _f32(a + b), zero)
 
     # Step 3: output — epilogue recomputes exp(x-max) / sum
     # CUDA ref: SoftMax.cu:71 (SoftMaxForwardEpilogue)
-    return [exp(cast(v) - cast(row_max)) / row_sum for v in row]
+    return [cast(exp(cast(v) - cast(row_max)) / row_sum) for v in row]
 
 
 def spec_softmax_spatial(data_2d: list, dim_size: int, inner_size: int,
@@ -764,10 +775,10 @@ def spec_softmax_spatial(data_2d: list, dim_size: int, inner_size: int,
                 m = max(m, data_2d[d * inner_size + inner])
             s = zero
             for d in range(dim_size):
-                s = s + exp(cast(data_2d[d * inner_size + inner]) - cast(m))
+                s = cast(s + exp(cast(data_2d[d * inner_size + inner]) - cast(m)))
             for d in range(dim_size):
                 idx = d * inner_size + inner
-                output[idx] = exp(cast(data_2d[idx]) - cast(m)) / s
+                output[idx] = cast(exp(cast(data_2d[idx]) - cast(m)) / s)
         else:
             # Multiple threads in dim: per-thread sequential at stride dim_threads,
             # then spatialBlockReduceX (shmem halving across dim_threads).
@@ -784,15 +795,15 @@ def spec_softmax_spatial(data_2d: list, dim_size: int, inner_size: int,
             thread_sums = [zero] * dim_threads
             for tx in range(dim_threads):
                 for d in range(tx, dim_size, dim_threads):
-                    thread_sums[tx] = thread_sums[tx] + exp(
-                        cast(data_2d[d * inner_size + inner]) - cast(m))
-            s = shmem_halving_reduce(thread_sums, lambda a, b: a + b, zero)
+                    thread_sums[tx] = cast(thread_sums[tx] + exp(
+                        cast(data_2d[d * inner_size + inner]) - cast(m)))
+            s = shmem_halving_reduce(thread_sums, lambda a, b: cast(a + b), zero)
 
             # Epilogue: each thread writes at stride dim_threads
             for tx in range(dim_threads):
                 for d in range(tx, dim_size, dim_threads):
                     idx = d * inner_size + inner
-                    output[idx] = exp(cast(data_2d[idx]) - cast(m)) / s
+                    output[idx] = cast(exp(cast(data_2d[idx]) - cast(m)) / s)
 
     return output
 
@@ -974,8 +985,8 @@ def spec_layer_norm_forward_moments(x_cuda: torch.Tensor,
     thread_welford = []
     for tid in range(block_size):
         m, s2, c = _compiled_welford_reduce(x_cuda, tid, block_size, n_vec, vec_size)
-        thread_welford.append((np.float32(m.item()), np.float32(s2.item()),
-                               np.float32(c.item())))
+        thread_welford.append((_f32(m.item()), _f32(s2.item()),
+                               _f32(c.item())))
 
     # Compiled Welford combine (wraps _compiled_welford_combine)
     def combine_wrap(a, b):
@@ -988,10 +999,10 @@ def spec_layer_norm_forward_moments(x_cuda: torch.Tensor,
         ta = [torch.tensor(float(v), device="cuda") for v in
               [ma, s2a, ca, mb, s2b, cb]]
         m, s2, c = _compiled_welford_combine(*ta)
-        return (np.float32(m.item()), np.float32(s2.item()),
-                np.float32(c.item()))
+        return (_f32(m.item()), _f32(s2.item()),
+                _f32(c.item()))
 
-    welford_id = (np.float32(0), np.float32(0), np.float32(0))
+    welford_id = (_f32(0), _f32(0), _f32(0))
 
     # Phase 2a: intra-warp shfl_down (high-to-low)
     warp_results = []
@@ -1012,11 +1023,11 @@ def spec_layer_norm_forward_moments(x_cuda: torch.Tensor,
 
     mean, m2, count = warp_results[0]
     # sigma2/N + eps → rsqrt via CUDA
-    var = np.float32(m2) / np.float32(float(N))
+    var = _f32(m2) / _f32(float(N))
     rstd = torch.rsqrt(
-        torch.tensor(float(var + np.float32(eps)),
+        torch.tensor(float(var + _f32(eps)),
                      dtype=torch.float32, device="cuda")).item()
-    return float(np.float32(mean)), rstd
+    return float(_f32(mean)), rstd
 
 
 def spec_rms_norm_forward(row: list, eps: float = 1e-5, block_size: int = 256,
@@ -1104,10 +1115,10 @@ def spec_rms_norm_forward_vectorized(x_cuda: torch.Tensor, eps: float = 1e-5,
     thread_sigma2 = []
     for tid in range(num_threads):
         s2 = _compiled_accum_sq(x_cuda, tid, num_threads, n_vec, vec_size)
-        thread_sigma2.append(np.float32(s2.item()))
+        thread_sigma2.append(_f32(s2.item()))
 
     # Phase 2: intra-warp shfl_down (pure addition — IEEE 754 exact)
-    add = lambda a, b: a + b
+    add = lambda a, b: _f32(a + b)
     warp_results = []
     for w in range(num_warps):
         warp_vals = thread_sigma2[w * warp_size:(w + 1) * warp_size]
@@ -1144,7 +1155,7 @@ def spec_rms_norm_backward_dx(dY: list, X: list, rstd: float,
             s2 = s2 + dYg * X[idx] * rstd
         thread_x2[tid] = s2
 
-    add = lambda a, b: a + b  # noqa: E731
+    add = lambda a, b: _f32(a + b)  # noqa: E731
 
     # Phase 2: BlockReduceSum
     stats_x2 = block_reduce_cuh(thread_x2, add, 0.0)
@@ -1156,6 +1167,31 @@ def spec_rms_norm_backward_dx(dY: list, X: list, rstd: float,
         dYg = dY[i] * gamma[i]
         dX.append(rstd * (dYg - X[i] * rstd * stats_x2 / fH))
     return dX
+
+
+def spec_rms_norm_backward_dgamma(dY_rows: list, X_rows: list,
+                                   rstd_list: list,
+                                   block_dim_y: int = 32) -> list:
+    """RMS norm backward dgamma: same GammaBetaBackwardCUDAKernel tree as
+    layer norm dgamma but without mean subtraction.
+    dgamma[j] = sum_m dY[m,j] * X[m,j] * rstd[m].
+
+    CUDA ref: cuda/layer_norm_kernel.cu:768 (GammaBetaBackwardCUDAKernelTemplate)."""
+    M = len(dY_rows)
+    N = len(dY_rows[0]) if M > 0 else 0
+    zero = type(dY_rows[0][0])(0) if M > 0 and N > 0 else 0.0
+
+    dgamma = [zero] * N
+    for j in range(N):
+        thread_sums = [zero] * block_dim_y
+        for tid in range(block_dim_y):
+            acc = zero
+            for m in range(tid, M, block_dim_y):
+                acc = acc + dY_rows[m][j] * X_rows[m][j] * rstd_list[m]
+            thread_sums[tid] = acc
+
+        dgamma[j] = shfl_xor_butterfly(thread_sums, lambda a, b: _f32(a + b))
+    return dgamma
 
 
 # ============================================================================
@@ -1294,54 +1330,243 @@ def spec_batch_norm_nhwc_stats(channel_data: list, block_y: int = 16):
 
 def spec_batch_norm_nchw_backward_reduce(
     grad_output: list, input_data: list, mean: float,
-    block_size: int = 512,
+    block_x: int, block_y: int, B: int, S: int,
 ):
-    """batch_norm_backward_kernel (NCHW): dual Float2 accumulation via
-    SHFL_XOR butterfly.
-    Computes sum_dy and sum_dy_xmu for one channel simultaneously.
-    grad_output, input_data = flat lists of (batch, spatial) values for one
-    channel.  Returns (sum_dy, sum_dy_xmu).
+    """reduce<Float2> from Normalization.cuh: Block2D + BlockReduce (shfl_down).
+    Models the 2D per-thread accumulation loop over (batch, spatial).
+    Per-thread dy_xmu uses fma(dy, x-mean, acc).
+    Returns (sum_dy, sum_dy_xmu).
 
-    CUDA ref: cuda/Normalization.cuh:387 (batch_norm_backward_kernel), :54 (Float2)."""
+    CUDA ref: cuda/Normalization.cuh:114 (reduce), :71 (GradOp),
+              cuda/block_reduce.cuh:130 (BlockReduce)."""
 
     assert len(grad_output) == len(input_data)
 
     def float2_add(a, b):
-        return (a[0] + b[0], a[1] + b[1])
+        return (_f32(a[0] + b[0]), _f32(a[1] + b[1]))
 
-    float2_id = (0.0, 0.0)
+    float2_id = (_f32(0.0), _f32(0.0))
+    block_size = block_x * block_y
 
-    # Phase 1: per-thread sequential accumulation of Float2
+    # Phase 1: 2D per-thread sequential accumulation (Block2D layout)
+    thread_vals = [float2_id] * block_size
+    for ty in range(block_y):
+        for tx in range(block_x):
+            acc_v1 = _f32(0.0)
+            acc_v2 = _f32(0.0)
+            for batch in range(ty, B, block_y):
+                for x in range(tx, S, block_x):
+                    flat_idx = batch * S + x
+                    dy = _f32(grad_output[flat_idx])
+                    c = _f32(_f32(input_data[flat_idx]) - _f32(mean))
+                    acc_v1 = _f32(acc_v1 + dy)
+                    acc_v2 = _fma_f32(dy, c, acc_v2)
+            thread_vals[tx + ty * block_x] = (acc_v1, acc_v2)
+
+    # Phase 2: BlockReduce from block_reduce.cuh (two-level shfl_down)
+    return block_reduce_cuh(thread_vals, float2_add, float2_id)
+
+
+@torch.compile
+def _compiled_bn_nchw_dx(go, inp, mean, proj_scale, grad_mean, grad_scale):
+    """Elementwise dx from batch_norm_backward_kernel (NCHW).
+    dx = (go - (inp - mean)*proj_scale - grad_mean) * grad_scale"""
+    proj = (inp - mean) * proj_scale
+    return (go - proj - grad_mean) * grad_scale
+
+
+def _bn_nchw_block_config_fused(spatial):
+    """Block config for the fused batch_norm_backward_kernel.
+    CUDA ref: cuda/Normalization.cuh:679-681."""
+    tf = 512
+    for s in [32, 64, 128, 256, 512]:
+        if spatial <= s:
+            tf = s
+            break
+    return tf, max(1, 512 // tf)
+
+
+def _bn_nchw_block_config_reduce(batch_size, feature_size):
+    """Block config for the separate batch_norm_backward_reduce_kernel.
+    CUDA ref: cuda/Normalization.cuh:854-858."""
+    def _last_pow2(n):
+        n |= (n >> 1); n |= (n >> 2); n |= (n >> 4)
+        n |= (n >> 8); n |= (n >> 16)
+        return max(1, n - (n >> 1))
+    block_y = min(_last_pow2(batch_size), 512 // 32)
+    tf = 512
+    for s in [32, 64, 128, 256, 512]:
+        if feature_size <= s:
+            tf = s
+            break
+    block_x = min(max(tf, 32), 512 // block_y)
+    return block_x, block_y
+
+
+def spec_batch_norm_nchw_backward(grad, x, mean_t, invstd_t, weight,
+                                  fused=True):
+    """Full NCHW batch norm backward.
+    fused=True: batch_norm_backward_kernel (reduce+elemt in one, when dx requested).
+    fused=False: batch_norm_backward_reduce_kernel (separate reduce).
+    CUDA ref: cuda/Normalization.cuh:387 (fused), :504 (reduce-only)."""
+    B, C = x.shape[0], x.shape[1]
+    spatial = 1
+    for d in x.shape[2:]:
+        spatial *= d
+    N = B * spatial
+
+    g = grad.detach().float().reshape(B, C, spatial)
+    xv = x.detach().float().reshape(B, C, spatial)
+    w = weight.detach().float()
+
+    if fused:
+        block_x, block_y = _bn_nchw_block_config_fused(spatial)
+    else:
+        block_x, block_y = _bn_nchw_block_config_reduce(B, spatial)
+
+    dx = torch.zeros_like(g)
+    dw = torch.zeros(C, device=x.device, dtype=torch.float32)
+    db = torch.zeros(C, device=x.device, dtype=torch.float32)
+
+    for c in range(C):
+        m = mean_t[c].float().item()
+        ist = invstd_t[c].float().item()
+        wc = w[c].item()
+
+        grad_ch = g[:, c, :].contiguous().view(-1).cpu().tolist()
+        input_ch = xv[:, c, :].contiguous().view(-1).cpu().tolist()
+        sum_dy, sum_dy_xmu = spec_batch_norm_nchw_backward_reduce(
+            grad_ch, input_ch, m,
+            block_x=block_x, block_y=block_y, B=B, S=spatial,
+        )
+
+        db[c] = sum_dy
+        dw[c] = _f32(sum_dy_xmu * ist)
+
+        # Elementwise phase
+        norm = _f32(1.0 / N)
+        grad_mean = _f32(sum_dy * norm)
+        proj_scale = _f32(_f32(_f32(sum_dy_xmu * norm) * ist) * ist)
+        grad_scale = _f32(ist * wc)
+
+        dx[:, c, :] = _compiled_bn_nchw_dx(
+            g[:, c, :], xv[:, c, :],
+            torch.tensor(m, device=x.device, dtype=torch.float32),
+            torch.tensor(proj_scale, device=x.device, dtype=torch.float32),
+            torch.tensor(grad_mean, device=x.device, dtype=torch.float32),
+            torch.tensor(grad_scale, device=x.device, dtype=torch.float32),
+        )
+
+    return (dx.reshape(x.shape), dw, db)
+
+
+def spec_batch_norm_nhwc_backward_reduce(
+    grad_output: list, input_data: list, mean: float,
+    block_y: int = 16,
+):
+    """batch_norm_backward_reduce_channels_last_kernel (NHWC): Float2
+    (sum_dy, sum_dy_xmu) accumulation via shmem_halving_reduce.
+    Per-thread dy_xmu uses fma(dy, x-mean, acc).
+    Returns (sum_dy, sum_dy_xmu).
+
+    CUDA ref: cuda/Normalization.cuh:1198 (batch_norm_backward_reduce_channels_last_kernel)."""
+    assert len(grad_output) == len(input_data)
+
+    def float2_add(a, b):
+        return (_f32(a[0] + b[0]), _f32(a[1] + b[1]))
+
+    float2_id = (_f32(0.0), _f32(0.0))
+    ELEMENTS_PER_ITER = 4
+
     thread_vals = []
-    for tid in range(min(block_size, len(grad_output))):
-        acc = float2_id
-        for idx in range(tid, len(grad_output), block_size):
-            dy = grad_output[idx]
-            dy_xmu = dy * (input_data[idx] - mean)
-            acc = float2_add(acc, (dy, dy_xmu))
-        thread_vals.append(acc)
-    while len(thread_vals) < block_size:
+    for tid in range(min(block_y, len(grad_output))):
+        accs = [float2_id] * ELEMENTS_PER_ITER
+        idx = tid
+        acc_idx = 0
+        while idx < len(grad_output):
+            dy = _f32(grad_output[idx])
+            c = _f32(_f32(input_data[idx]) - _f32(mean))
+            a0, a1 = accs[acc_idx]
+            accs[acc_idx] = (_f32(a0 + dy), _fma_f32(dy, c, a1))
+            acc_idx = (acc_idx + 1) % ELEMENTS_PER_ITER
+            idx += block_y
+        result = accs[0]
+        for i in range(1, ELEMENTS_PER_ITER):
+            result = float2_add(result, accs[i])
+        thread_vals.append(result)
+    while len(thread_vals) < block_y:
         thread_vals.append(float2_id)
 
-    # Phase 2: two-level SHFL_XOR butterfly (same as NCHW forward stats)
-    warp_size = 32
-    num_warps = math.ceil(block_size / warp_size)
+    return shmem_halving_reduce(thread_vals, float2_add, float2_id)
 
-    warp_results = []
-    for w in range(num_warps):
-        start = w * warp_size
-        end = min(start + warp_size, block_size)
-        warp_vals = thread_vals[start:end]
-        while len(warp_vals) < warp_size:
-            warp_vals.append(float2_id)
-        warp_results.append(shfl_xor_butterfly(warp_vals, float2_add))
 
-    while len(warp_results) < warp_size:
-        warp_results.append(float2_id)
-    sum_dy, sum_dy_xmu = shfl_xor_butterfly(
-        warp_results[:warp_size], float2_add
-    )
-    return sum_dy, sum_dy_xmu
+@torch.compile
+def _compiled_bn_nhwc_dx(go, inp, m_c, factor_1_c, m_dy_c, factor_2_c):
+    """Elementwise dx from batch_norm_backward_elemt_channels_last_kernel.
+    dx = (go - m_dy_c - (inp - m_c)*factor_1_c) * factor_2_c"""
+    return (go - m_dy_c - (inp - m_c) * factor_1_c) * factor_2_c
+
+
+def spec_batch_norm_nhwc_backward(grad, x, mean_t, invstd_t, weight):
+    """Full NHWC batch norm backward (separate reduce + elemt, grid.y=1).
+    CUDA ref: cuda/Normalization.cuh:1198 (reduce), :1355 (elemt)."""
+    B, C = x.shape[0], x.shape[1]
+    spatial = 1
+    for d in x.shape[2:]:
+        spatial *= d
+    N = B * spatial
+
+    x_contig = x.to(memory_format=torch.contiguous_format)
+    g_contig = grad.to(memory_format=torch.contiguous_format)
+    g = g_contig.detach().float().reshape(B, C, spatial)
+    xv = x_contig.detach().float().reshape(B, C, spatial)
+    w = weight.detach().float()
+
+    # NHWC reduce block config: flexible_launch_configs
+    stride = C
+    red = N  # reduction_size = B * H * W
+    def _last_pow2(n):
+        n |= (n >> 1); n |= (n >> 2); n |= (n >> 4)
+        n |= (n >> 8); n |= (n >> 16)
+        return max(1, n - (n >> 1))
+    bx = min(_last_pow2(stride), 32)
+    by = min(_last_pow2((red + 15) // 16), 512 // bx)
+    if bx * by != 512:
+        bx = min(_last_pow2(stride), 512 // by)
+
+    dx = torch.zeros_like(g)
+    dw = torch.zeros(C, device=x.device, dtype=torch.float32)
+    db = torch.zeros(C, device=x.device, dtype=torch.float32)
+
+    for c in range(C):
+        m = mean_t[c].float().item()
+        ist = invstd_t[c].float().item()
+        wc = w[c].item()
+
+        grad_ch = g[:, c, :].contiguous().view(-1).cpu().tolist()
+        input_ch = xv[:, c, :].contiguous().view(-1).cpu().tolist()
+        sum_dy, sum_dy_xmu = spec_batch_norm_nhwc_backward_reduce(
+            grad_ch, input_ch, m, block_y=by,
+        )
+
+        db[c] = sum_dy
+        dw[c] = _f32(sum_dy_xmu * ist)
+
+        # Elementwise: same formula as NCHW elemt kernel
+        norm_fct = _f32(1.0 / N)
+        m_dy_c = _f32(sum_dy * norm_fct)
+        factor_1_c = _f32(_f32(ist * ist) * _f32(sum_dy_xmu * norm_fct))
+        factor_2_c = _f32(wc * ist)
+
+        dx[:, c, :] = _compiled_bn_nhwc_dx(
+            g[:, c, :], xv[:, c, :],
+            torch.tensor(m, device=x.device, dtype=torch.float32),
+            torch.tensor(factor_1_c, device=x.device, dtype=torch.float32),
+            torch.tensor(m_dy_c, device=x.device, dtype=torch.float32),
+            torch.tensor(factor_2_c, device=x.device, dtype=torch.float32),
+        )
+
+    return (dx.reshape(x_contig.shape), dw, db)
 
 
 # ============================================================================
@@ -1355,21 +1580,21 @@ def spec_nll_loss_reduce(losses: list, block_size: int = 512):
     CUDA ref: cuda/Loss.cu:224 (nll_loss_forward_reduce_cuda_kernel_2d)."""
 
     # Phase 1: per-thread sequential sum at stride block_size
-    zero = type(losses[0])(0) if losses else 0.0
+    zero = _f32(0.0) if losses else 0.0
     thread_sums = [zero] * block_size
     for tid in range(min(block_size, len(losses))):
         for idx in range(tid, len(losses), block_size):
-            thread_sums[tid] = thread_sums[tid] + losses[idx]
+            thread_sums[tid] = _f32(thread_sums[tid] + losses[idx])
 
     # Phase 2: shared-memory halving tree (NO warp shuffles)
-    return shmem_halving_reduce(thread_sums, lambda a, b: a + b, zero)
+    return shmem_halving_reduce(thread_sums, lambda a, b: _f32(a + b), zero)
 
 
 def spec_multi_margin_loss_thread0_scan(per_thread_sums: list):
     """MultiMarginLoss: thread 0 serial scan of all buffer entries.
 
     CUDA ref: cuda/MultiMarginLoss.cu:24 (MultiMarginLoss_forward_kernel)."""
-    return thread_0_serial_scan(per_thread_sums, lambda a, b: a + b, 0.0)
+    return thread_0_serial_scan(per_thread_sums, lambda a, b: _f32(a + b), 0.0)
 
 
 # ============================================================================
@@ -1382,15 +1607,15 @@ def spec_cumsum_innermost_sklansky(row: list, num_threads_x: int = 128):
 
     CUDA ref: cuda/ScanUtils.cuh:60 (tensor_kernel_scan_innermost_dim_with_indices), :114 (Sklansky tree loop)."""
     output = []
-    carry = 0.0
+    carry = _f32(0.0)
     chunk_size = 2 * num_threads_x
 
     for chunk_start in range(0, len(row), chunk_size):
         chunk = list(row[chunk_start:chunk_start + chunk_size])
         while len(chunk) < chunk_size:
-            chunk.append(0.0)
+            chunk.append(_f32(0.0))
         # Add carry to first element
-        chunk[0] = chunk[0] + carry
+        chunk[0] = _f32(chunk[0] + carry)
 
         # Sklansky tree
         s = 1
@@ -1401,7 +1626,7 @@ def spec_cumsum_innermost_sklansky(row: list, num_threads_x: int = 128):
                 ti = a + (tid % s)
                 si = a - 1
                 if ti < chunk_size and si < chunk_size:
-                    new_chunk[ti] = chunk[si] + chunk[ti]
+                    new_chunk[ti] = _f32(chunk[si] + chunk[ti])
             chunk = new_chunk
             s *= 2
 
@@ -1421,7 +1646,7 @@ def spec_cumsum_outer_sequential(data_2d: list, num_rows: int,
     output = list(data_2d)
     for col in range(num_cols):
         for row in range(1, num_rows):
-            output[row * num_cols + col] = (
+            output[row * num_cols + col] = _f32(
                 output[(row - 1) * num_cols + col] + data_2d[row * num_cols + col]
             )
     return output
@@ -1433,14 +1658,14 @@ def spec_cumprod_innermost_sklansky(row: list, num_threads_x: int = 128):
 
     CUDA ref: cuda/ScanUtils.cuh:60 (tensor_kernel_scan_innermost_dim_with_indices)."""
     output = []
-    carry = 1.0
+    carry = _f32(1.0)
     chunk_size = 2 * num_threads_x
 
     for chunk_start in range(0, len(row), chunk_size):
         chunk = list(row[chunk_start:chunk_start + chunk_size])
         while len(chunk) < chunk_size:
-            chunk.append(1.0)
-        chunk[0] = chunk[0] * carry
+            chunk.append(_f32(1.0))
+        chunk[0] = _f32(chunk[0] * carry)
 
         s = 1
         while s <= num_threads_x:
@@ -1450,7 +1675,7 @@ def spec_cumprod_innermost_sklansky(row: list, num_threads_x: int = 128):
                 ti = a + (tid % s)
                 si = a - 1
                 if ti < chunk_size and si < chunk_size:
-                    new_chunk[ti] = chunk[si] * chunk[ti]
+                    new_chunk[ti] = _f32(chunk[si] * chunk[ti])
             chunk = new_chunk
             s *= 2
 
@@ -1469,7 +1694,7 @@ def spec_cumprod_outer_sequential(data_2d: list, num_rows: int,
     output = list(data_2d)
     for col in range(num_cols):
         for row in range(1, num_rows):
-            output[row * num_cols + col] = (
+            output[row * num_cols + col] = _f32(
                 output[(row - 1) * num_cols + col] * data_2d[row * num_cols + col]
             )
     return output
@@ -1538,21 +1763,20 @@ def spec_avg_pool_window(window_values: list):
     """AveragePool2d: sequential nested loop over kernel window.
 
     CUDA ref: cuda/AveragePool2d.cu:33 (avg_pool2d_out_cuda_frame)."""
-    # Use input dtype for accumulator (e.g. np.float32 stays fp32)
-    acc = type(window_values[0])(0)
+    acc = _f32(0.0)
     for v in window_values:
-        acc = acc + v
-    count = type(window_values[0])(len(window_values))
-    return acc / count
+        acc = _f32(acc + v)
+    count = _f32(len(window_values))
+    return _f32(acc / count)
 
 
 def spec_embedding_bag_sum(embeddings: list):
     """EmbeddingBag SUM: sequential loop over bag, one thread per feature.
 
     CUDA ref: cuda/EmbeddingBag.cu:115 (EmbeddingBag_updateOutputKernel_sum_mean)."""
-    acc = type(embeddings[0])(0)
+    acc = _f32(0.0)
     for emb in embeddings:
-        acc = acc + emb
+        acc = _f32(acc + emb)
     return acc
 
 
@@ -1666,10 +1890,10 @@ def spec_softmax_backward_inner(grad: list, output: list,
     n = len(grad)
     B = block_size
     ILP = 4
-    zero = type(grad[0])(0) if grad else 0.0
+    zero = _f32(0.0) if grad else 0.0
 
     # Pre-multiply (done outside kernel in softmax_backward_cuda_out)
-    tmp = [grad[i] * output[i] for i in range(n)]
+    tmp = [_f32(grad[i] * output[i]) for i in range(n)]
 
     # Phase 1: ilpReduce with ILP=4 consecutive elements per vector load
     # Matches forward's ilpReduce pattern (SoftMax.cu:487)
@@ -1681,19 +1905,19 @@ def spec_softmax_backward_inner(grad: list, output: list,
         offset = tid
         while offset * ILP < main_end:
             for j in range(ILP):
-                acc = acc + tmp[offset * ILP + j]
+                acc = _f32(acc + tmp[offset * ILP + j])
             offset += B
         tail_offset = main_end + tid
         while tail_offset < n:
-            acc = acc + tmp[tail_offset]
+            acc = _f32(acc + tmp[tail_offset])
             tail_offset += B
         thread_sums[tid] = acc
 
     # Phase 2: BlockReduceSum (block_reduce.cuh)
-    row_sum = block_reduce_cuh(thread_sums, lambda a, b: a + b, zero)
+    row_sum = block_reduce_cuh(thread_sums, lambda a, b: _f32(a + b), zero)
 
     # Phase 3: epilogue: tmp[i] - output[i] * sum  (SoftMax.cu:86)
-    return [tmp[i] - output[i] * row_sum for i in range(n)]
+    return [_f32(tmp[i] - _f32(output[i] * row_sum)) for i in range(n)]
 
 
 # NOTE: spec_softmax_backward_spatial is not provided because it is
@@ -1702,6 +1926,51 @@ def spec_softmax_backward_inner(grad: list, output: list,
 #
 # NOTE: spec_softmax_backward_persistent is not provided because it uses
 # the same SHFL_XOR butterfly tree as spec_softmax_persistent.
+
+
+def spec_log_softmax_backward_spatial(grad_2d: list, output_2d: list,
+                                       dim_size: int, inner_size: int,
+                                       dtype=None) -> list:
+    """Spatial log_softmax backward: sum(grad) per inner position via
+    spatialBlockReduceX, then grad_input = grad - exp(output) * sum(grad).
+    Same spatial tree as forward for the sum reduction.
+
+    CUDA ref: cuda/SoftMax.cu:262 (cunn_SpatialSoftMaxBackward)."""
+    exp = _dtype_exp(dtype)
+    cast = _dtype_cast(dtype)
+    zero = _dtype_identity(dtype, 0.0)
+    result = [zero] * len(grad_2d)
+
+    max_block = 1024
+    inner_threads = min(inner_size, max_block)
+    dim_threads = 1
+    if inner_threads <= 64 and dim_size >= 64:
+        while inner_threads * dim_threads <= max_block and dim_threads <= dim_size:
+            dim_threads *= 2
+        dim_threads //= 2
+
+    for inner in range(inner_size):
+        if dim_threads == 1:
+            s = zero
+            for d in range(dim_size):
+                s = cast(s + grad_2d[d * inner_size + inner])
+        else:
+            thread_sums = [zero] * dim_threads
+            for tx in range(dim_threads):
+                for d in range(tx, dim_size, dim_threads):
+                    thread_sums[tx] = cast(thread_sums[tx] + grad_2d[d * inner_size + inner])
+            s = shmem_halving_reduce(thread_sums, lambda a, b: cast(a + b), zero)
+
+        s_t = torch.tensor(float(s), device="cuda", dtype=torch.float32)
+        for d in range(dim_size):
+            idx = d * inner_size + inner
+            g_t = torch.tensor(float(grad_2d[idx]), device="cuda",
+                               dtype=torch.float32)
+            exp_o = torch.tensor(float(output_2d[idx]), device="cuda",
+                                 dtype=torch.float32).exp()
+            result[idx] = _compiled_softmax_backward_epilogue(
+                g_t, exp_o, s_t).item()
+    return result
 
 
 def spec_layer_norm_backward_dx(dY: list, X: list, mean: float, rstd: float,
@@ -1725,7 +1994,7 @@ def spec_layer_norm_backward_dx(dY: list, X: list, mean: float, rstd: float,
         thread_x1[tid] = s1
         thread_x2[tid] = s2
 
-    add = lambda a, b: a + b  # noqa: E731
+    add = lambda a, b: _f32(a + b)  # noqa: E731
 
     # Phase 2: BlockReduceSum (block_reduce.cuh) for both
     stats_x1 = block_reduce_cuh(thread_x1, add, 0.0)
@@ -1761,7 +2030,7 @@ def spec_layer_norm_backward_dgamma(dY_rows: list, X_rows: list,
     CUDA ref: cuda/layer_norm_kernel.cu:768 (GammaBetaBackwardCUDAKernelTemplate), :602 (GammaBetaBackwardSimpleCUDAKernel for small-M)."""
     M = len(dY_rows)
     N = len(dY_rows[0]) if M > 0 else 0
-    # Infer zero from data dtype (np.float32 stays fp32)
+    # Infer zero from data dtype (float stays fp32)
     zero = type(dY_rows[0][0])(0) if M > 0 and N > 0 else 0.0
 
     dgamma = [zero] * N
@@ -1774,8 +2043,192 @@ def spec_layer_norm_backward_dgamma(dY_rows: list, X_rows: list,
             thread_sums[tid] = acc
 
         # Phase 2: SHFL_XOR butterfly across block_dim_y
-        dgamma[j] = shfl_xor_butterfly(thread_sums, lambda a, b: a + b)
+        dgamma[j] = shfl_xor_butterfly(thread_sums, lambda a, b: _f32(a + b))
     return dgamma
+
+
+def spec_layer_norm_backward_dbeta(dY: torch.Tensor,
+                                   block_dim_y: int = 32,
+                                   rows_per_block_y: int = 256) -> torch.Tensor:
+    """GammaBetaBackwardCUDAKernelTemplate: dbeta reduction (tensor-based).
+    Per-thread sequential sum over contiguous row blocks, then SHFL_XOR
+    butterfly high-to-low across block_dim_y.
+
+    CUDA ref: cuda/layer_norm_kernel.cu:768 (GammaBetaBackwardCUDAKernelTemplate)."""
+    M, N = dY.shape
+    rows_per_thread_y = rows_per_block_y // block_dim_y
+
+    # Phase 1: per-thread sequential accumulation (contiguous row blocks)
+    thread_sums = torch.zeros(block_dim_y, N, device=dY.device, dtype=dY.dtype)
+    for M_start in range(0, M, rows_per_block_y):
+        for tid_y in range(block_dim_y):
+            for i in range(rows_per_thread_y):
+                m = M_start + tid_y * rows_per_thread_y + i
+                if m < M:
+                    thread_sums[tid_y] = thread_sums[tid_y] + dY[m]
+
+    # Phase 2: SHFL_XOR butterfly high-to-low
+    if block_dim_y <= 1:
+        return thread_sums[0]
+    vals = thread_sums.clone()
+    delta = block_dim_y // 2
+    while delta >= 1:
+        new_vals = vals.clone()
+        for i in range(block_dim_y):
+            partner = i ^ delta
+            if 0 <= partner < block_dim_y:
+                new_vals[i] = vals[i] + vals[partner]
+        vals = new_vals
+        delta //= 2
+    return vals[0]
+
+
+def spec_gamma_beta_backward_dgamma_simple(
+    dY_rows: list, X_rows: list, mean_list: list, rstd_list: list,
+) -> list:
+    """GammaBetaBackwardCUDAKernelTemplate with block_dim_y=1: purely sequential
+    dgamma per feature.  Uses _fma_f32 to match nvcc's FMA contraction:
+    fma(dY*(X-mean), rstd, acc).
+
+    CUDA ref: cuda/layer_norm_kernel.cu:768 (with block_dim_y=1, partial_reduction=true)."""
+    M = len(dY_rows)
+    N = len(dY_rows[0]) if M > 0 else 0
+    dgamma = [_f32(0.0)] * N
+    for j in range(N):
+        acc = _f32(0.0)
+        for m in range(M):
+            t = _f32(_f32(dY_rows[m][j]) * _f32(_f32(X_rows[m][j]) - _f32(mean_list[m])))
+            acc = _fma_f32(t, _f32(rstd_list[m]), acc)
+        dgamma[j] = acc
+    return dgamma
+
+
+def spec_group_norm_backward_internal(grad_3d, x_3d, N_batch, C, HxW, num_threads=32):
+    """ComputeInternalGradientsCUDAKernel: per-(n,c) pair compute
+    ds[n,c] = sum_hw(dY*X) and db[n,c] = sum_hw(dY).
+    Tree: sequential at stride num_threads, then WarpReduceSum (shfl_down).
+    FMA in ds: fma(dY, X, acc).
+    Returns (ds, db) as lists of shape [N_batch][C].
+
+    CUDA ref: cuda/group_norm_kernel.cu:276 (ComputeInternalGradientsCUDAKernel)."""
+    g = grad_3d.reshape(N_batch, C, HxW).cpu().tolist()
+    xv = x_3d.reshape(N_batch, C, HxW).cpu().tolist()
+    ds = [[0.0] * C for _ in range(N_batch)]
+    db = [[0.0] * C for _ in range(N_batch)]
+    add = lambda a, b: _f32(a + b)  # noqa: E731
+    for n in range(N_batch):
+        for c in range(C):
+            ts_ds = [_f32(0.0)] * num_threads
+            ts_db = [_f32(0.0)] * num_threads
+            for tid in range(num_threads):
+                acc_ds, acc_db = _f32(0.0), _f32(0.0)
+                for hw in range(tid, HxW, num_threads):
+                    acc_ds = _fma_f32(_f32(g[n][c][hw]), _f32(xv[n][c][hw]), acc_ds)
+                    acc_db = _f32(acc_db + _f32(g[n][c][hw]))
+                ts_ds[tid] = acc_ds
+                ts_db[tid] = acc_db
+            ds[n][c] = shfl_down_reduce_high_to_low(ts_ds, add)
+            db[n][c] = shfl_down_reduce_high_to_low(ts_db, add)
+    return ds, db
+
+
+def spec_group_norm_backward_dw_db(ds, db, mean_t, rstd_t, N_batch, C, G):
+    """GammaBetaBackwardCUDAKernel1: sequential loop over N for dgamma and dbeta.
+    dgamma[c] = sum_n((ds[n,c] - db[n,c]*mean[n,g]) * rstd[n,g])
+    dbeta[c] = sum_n(db[n,c])
+    FMA contractions: fma(-db, mean, ds) and fma(result, rstd, sum1).
+    Returns (dgamma, dbeta) lists of length C.
+
+    CUDA ref: cuda/group_norm_kernel.cu:355 (GammaBetaBackwardCUDAKernel1)."""
+    D = C // G
+    ml = mean_t.cpu().tolist()
+    rl = rstd_t.cpu().tolist()
+    dgamma = [_f32(0.0)] * C
+    dbeta = [_f32(0.0)] * C
+    for c in range(C):
+        g = c // D
+        dg_acc = _f32(0.0)
+        db_acc = _f32(0.0)
+        for n in range(N_batch):
+            t = _fma_f32(-_f32(db[n][c]), _f32(ml[n][g]), _f32(ds[n][c]))
+            dg_acc = _fma_f32(t, _f32(rl[n][g]), dg_acc)
+            db_acc = _f32(db_acc + _f32(db[n][c]))
+        dgamma[c] = dg_acc
+        dbeta[c] = db_acc
+    return dgamma, dbeta
+
+
+@torch.compile
+def _compiled_gn_c2c3(sum1, sum2, mean_ng, rstd_ng, s):
+    """ComputeBackwardFusedParamsCUDAKernel: c2, c3 formula (thread 0).
+    FMA matching: (sum2*mean - sum1) * rstd^3 * s and -c2*mean - sum2*rstd*s.
+
+    CUDA ref: cuda/group_norm_kernel.cu:344-351."""
+    t = sum2 * mean_ng - sum1
+    c2 = t * rstd_ng * rstd_ng * rstd_ng * s
+    c3 = -c2 * mean_ng - sum2 * rstd_ng * s
+    return c2, c3
+
+
+@torch.compile
+def _compiled_gn_dx_elem(c1, dy, c2, x, c3):
+    """Group norm elementwise dx = c1*dy + c2*x + c3 with FMA matching.
+
+    CUDA ref: cuda/group_norm_kernel.cu:903."""
+    return c1 * dy + c2 * x + c3
+
+
+def spec_group_norm_backward_dx(grad, x, mean_t, rstd_t, weight, ds, db,
+                                N_batch, C, HxW, G, num_threads=32):
+    """Group norm backward dx: WarpReduceSum tree for sum1/sum2 over D channels,
+    compiled c2/c3 formula, compiled elementwise dx = c1*dy + c2*x + c3.
+
+    CUDA ref: cuda/group_norm_kernel.cu:307, :891-923."""
+    D = C // G
+    wl = weight.cpu().tolist()
+    add = lambda a, b: _f32(a + b)  # noqa: E731
+    nt2 = 32 if D < 512 else 512
+
+    c2_t = torch.zeros(N_batch, G, device=grad.device, dtype=torch.float32)
+    c3_t = torch.zeros(N_batch, G, device=grad.device, dtype=torch.float32)
+
+    for n in range(N_batch):
+        for gi in range(G):
+            vals1 = [_f32(0.0)] * nt2
+            vals2 = [_f32(0.0)] * nt2
+            for tid in range(nt2):
+                a1, a2 = _f32(0.0), _f32(0.0)
+                for i in range(tid, D, nt2):
+                    c_idx = gi * D + i
+                    gamma_v = _f32(wl[c_idx])
+                    a1 = _f32(a1 + _f32(_f32(ds[n][c_idx]) * gamma_v))
+                    a2 = _f32(a2 + _f32(_f32(db[n][c_idx]) * gamma_v))
+                vals1[tid] = a1
+                vals2[tid] = a2
+            if nt2 <= 32:
+                s1 = shfl_down_reduce_high_to_low(vals1, add)
+                s2 = shfl_down_reduce_high_to_low(vals2, add)
+            else:
+                s1 = block_reduce_cuh(vals1, add, _f32(0.0))
+                s2 = block_reduce_cuh(vals2, add, _f32(0.0))
+
+            s_val = 1.0 / (D * HxW)
+            c2v, c3v = _compiled_gn_c2c3(
+                torch.tensor(s1, device='cuda'), torch.tensor(s2, device='cuda'),
+                mean_t[n, gi], rstd_t[n, gi],
+                torch.tensor(s_val, device='cuda'),
+            )
+            c2_t[n, gi] = c2v
+            c3_t[n, gi] = c3v
+
+    c1_t = rstd_t.view(N_batch, G, 1) * weight.view(1, G, D)
+    return _compiled_gn_dx_elem(
+        c1_t.unsqueeze(-1),
+        grad.reshape(N_batch, G, D, HxW),
+        c2_t.view(N_batch, G, 1, 1),
+        x.reshape(N_batch, G, D, HxW),
+        c3_t.view(N_batch, G, 1, 1),
+    ).reshape(grad.shape)
 
 
 def spec_scatter_add(dest_size: int, indices: list, src_values: list) -> list:
@@ -1809,9 +2262,558 @@ def spec_embedding_bag_psw_backward(grad: list, weight: list, indices: list,
 
         # Phase 2: WarpReduceSum (shfl_down high-to-low)
         results.append(
-            shfl_down_reduce_high_to_low(lane_sums, lambda a, b: a + b)
+            shfl_down_reduce_high_to_low(lane_sums, lambda a, b: _f32(a + b))
         )
     return results
+
+
+# ============================================================================
+# Reference backward specifications (mathematical gradient formulas)
+# ============================================================================
+# Sequential torch-CUDA implementations of gradient formulas.  These don't
+# model the CUDA kernel's reduction tree but compute mathematically correct
+# gradients on the same device, in float64, as independent references.
+
+def ref_prod_backward(grad, x):
+    """Gradient of prod(x, dim=-1).  Matches C++ autograd:
+    grad * (result / input), which is used when no zeros present."""
+    xf = x.detach().float()
+    gf = grad.detach().float()
+    result = torch.prod(xf, dim=-1)
+    return gf.unsqueeze(-1) * (result.unsqueeze(-1) / xf)
+
+
+def ref_var_backward(grad, x, correction=1):
+    """Gradient of var(x, dim=-1).  Matches autograd decomposition:
+    (grad * scalar(2/(N-correction))).unsqueeze(-1) * (x - mean)."""
+    xf = x.detach().float()
+    gf = grad.detach().float()
+    N = xf.shape[-1]
+    mean = xf.mean(dim=-1, keepdim=True)
+    return (gf * (2.0 / (N - correction))).unsqueeze(-1) * (xf - mean)
+
+
+def ref_std_backward(grad, x, correction=1):
+    """Gradient of std(x, dim=-1).  Matches autograd decomposition:
+    coeff = grad / (2*std), masked to 0 where std==0, then
+    (coeff * scalar(2/(N-correction))).unsqueeze(-1) * (x - mean)."""
+    xf = x.detach().float()
+    gf = grad.detach().float()
+    N = xf.shape[-1]
+    std_fwd = torch.std(xf, dim=-1)
+    coeff = gf / (std_fwd * 2)
+    coeff = coeff.masked_fill(std_fwd == 0, 0)
+    mean = xf.mean(dim=-1, keepdim=True)
+    return (coeff * (2.0 / (N - correction))).unsqueeze(-1) * (xf - mean)
+
+
+def ref_norm_l2_backward(grad, x):
+    """Gradient of ||x||_2 along dim=-1.  Matches autograd decomposition:
+    grad * (x / norm), where division happens first."""
+    xf = x.detach().float()
+    gf = grad.detach().float()
+    norm = torch.linalg.vector_norm(xf, 2, dim=-1)
+    div_result = xf / norm.unsqueeze(-1)
+    div_result = div_result.masked_fill(norm.unsqueeze(-1) == 0, 0)
+    return gf.unsqueeze(-1) * div_result
+
+
+def ref_norm_lp_backward(grad, x, p):
+    """Gradient of ||x||_p along dim=0.  Matches autograd decomposition:
+    (x * |x|^(p-2)) * (grad / norm^(p-1))."""
+    xf = x.detach().float()
+    gf = grad.detach().float()
+    norm = torch.linalg.vector_norm(xf, p, dim=0)
+    signed = xf * xf.abs().pow(p - 2)
+    coeff = gf / norm.pow(p - 1)
+    coeff = coeff.masked_fill(norm == 0, 0)
+    return signed * coeff.unsqueeze(0)
+
+
+def ref_nll_loss_backward(num_samples, num_classes, target, reduction="mean"):
+    """Gradient of nll_loss (input = log_probs).  Scatter -1 at target."""
+    dx = torch.zeros(num_samples, num_classes, device=target.device)
+    dx.scatter_(1, target.unsqueeze(1), -1.0)
+    if reduction == "mean":
+        dx /= num_samples
+    return dx
+
+
+def ref_nll_loss_2d_backward(x_shape, target, reduction="mean"):
+    """Gradient of nll_loss for 4D input.  Scatter -1 at target positions."""
+    B, C, H, W = x_shape
+    dx = torch.zeros(x_shape, device=target.device)
+    N = B * H * W
+    for b in range(B):
+        for h in range(H):
+            for w in range(W):
+                dx[b, target[b, h, w], h, w] = -1.0
+    if reduction == "mean":
+        dx /= N
+    return dx
+
+
+def ref_cross_entropy_forward(x, target):
+    """Cross entropy = log_softmax + nll_loss.  Uses CUDA kernels directly."""
+    xf = x.detach().float()
+    log_soft = torch.nn.functional.log_softmax(xf, dim=-1)
+    return torch.nn.functional.nll_loss(log_soft, target).item()
+
+
+def ref_cross_entropy_backward(x, target):
+    """Gradient of cross_entropy (mean).  Matches autograd decomposition:
+    log_softmax forward, nll_loss_backward, _log_softmax_backward_data."""
+    xf = x.detach().float()
+    N = xf.shape[0]
+    log_soft = torch.ops.aten._log_softmax.default(xf, 1, False)
+    nll_grad = torch.zeros_like(xf)
+    nll_grad.scatter_(1, target.unsqueeze(1), -1.0 / N)
+    return torch.ops.aten._log_softmax_backward_data.default(
+        nll_grad, log_soft, 1, torch.float32)
+
+
+def ref_multi_margin_loss_backward(x, target, p=1, margin=1.0):
+    """Gradient of multi_margin_loss (p=1, mean reduction)."""
+    xf = x.detach().float()
+    N, C = xf.shape
+    dx = torch.zeros_like(xf)
+    for i in range(N):
+        tgt = target[i].item()
+        for c in range(C):
+            if c == tgt:
+                continue
+            if margin - xf[i, tgt].item() + xf[i, c].item() > 0:
+                dx[i, c] += 1.0 / C
+                dx[i, tgt] -= 1.0 / C
+    dx /= N
+    return dx
+
+
+def ref_multilabel_margin_loss_forward(x, target):
+    """Multilabel margin loss matching CUDA kernel (MultiLabelMarginCriterion.cu).
+    Per-sample: 128-thread sequential hinge + BlockReduceSum, /dim /nframe.
+    Final: sum per-sample values via gpu_reduce_kernel."""
+    xf = x.detach().float()
+    B, C = xf.shape
+    THREADS = 128
+    per_sample = []
+    for bi in range(B):
+        target_set = set()
+        for j in range(C):
+            if target[bi, j].item() < 0:
+                break
+            target_set.add(target[bi, j].item())
+        thread_sums = [_f32(0.0)] * THREADS
+        for dt in range(C):
+            if target[bi, dt].item() < 0:
+                break
+            tgt_label = target[bi, dt].item()
+            input_target_k = xf[bi, tgt_label].item()
+            for tid in range(THREADS):
+                for d in range(tid, C, THREADS):
+                    if d not in target_set:
+                        z = _f32(_f32(1 - input_target_k) + xf[bi, d].item())
+                        if z > 0:
+                            thread_sums[tid] = _f32(thread_sums[tid] + float(z))
+        total = block_reduce_cuh(
+            thread_sums, lambda a, b: _f32(a + b), _f32(0.0))
+        per_sample.append(_f32(_f32(float(total) / C) / B))
+    add = lambda a, b: _f32(a + b)
+    return float(spec_gpu_reduce_kernel(
+        per_sample, add, _f32(0.0), num_outputs=1, stride1=True))
+
+
+def ref_multilabel_margin_loss_backward(x, target):
+    """Gradient of multilabel_margin_loss matching CUDA backward kernel.
+    Per-sample: g = 1/(nframe*dim), thread-local grad_input += g or -= g,
+    then BlockReduceSum for target gradient, then multiply by grad_output."""
+    xf = x.detach().float()
+    B, C = xf.shape
+    THREADS = 128
+    dx = torch.zeros_like(xf)
+    g = _f32(1.0 / _f32(B * C))
+    for bi in range(B):
+        target_set = set()
+        for j in range(C):
+            if target[bi, j].item() < 0:
+                break
+            target_set.add(target[bi, j].item())
+        for dt in range(C):
+            if target[bi, dt].item() < 0:
+                break
+            tgt_label = target[bi, dt].item()
+            input_target_k = xf[bi, tgt_label].item()
+            thread_sums = [_f32(0.0)] * THREADS
+            for tid in range(THREADS):
+                for d in range(tid, C, THREADS):
+                    if d not in target_set:
+                        z = _f32(_f32(1 - input_target_k) + xf[bi, d].item())
+                        if z > 0:
+                            thread_sums[tid] = _f32(thread_sums[tid] - g)
+                            dx[bi, d] = _f32(dx[bi, d].item() + g)
+            total_sum = block_reduce_cuh(
+                thread_sums, lambda a, b: _f32(a + b), _f32(0.0))
+            dx[bi, tgt_label] = _f32(dx[bi, tgt_label].item() + float(total_sum))
+    return dx
+
+
+def ref_ctc_loss_forward_backward(log_probs, targets, input_lengths,
+                                   target_lengths, blank=0):
+    """CTC forward + backward via alpha-beta DP.  Returns (loss, grad).
+    All computations in float32 CUDA matching LossCTC.cu kernel exactly:
+    -INFINITY, 3-way logaddexp, kernel beta convention, naive collect."""
+    T, N, C = log_probs.shape
+    dev = log_probs.device
+    lp = log_probs.detach().float()
+    NEG_INF = float('-inf')
+    targets_cpu = targets.cpu()
+    il_cpu = input_lengths.cpu()
+    tl_cpu = target_lengths.cpu()
+
+    grad = torch.zeros(T, N, C, dtype=torch.float32, device=dev)
+    losses = []
+
+    for b in range(N):
+        inp_len = il_cpu[b].item()
+        tgt_len = tl_cpu[b].item()
+        tgt = targets_cpu[b, :tgt_len].long()
+        S = 2 * tgt_len + 1
+        labels = [blank] * S
+        for k in range(tgt_len):
+            labels[2 * k + 1] = tgt[k].item()
+        labels_t = torch.tensor(labels, dtype=torch.long, device=dev)
+
+        # Precompute have_three masks
+        have_three_fwd = torch.zeros(S, dtype=torch.bool, device=dev)
+        for s in range(2, S):
+            if labels[s] != blank and labels[s] != labels[s - 2]:
+                have_three_fwd[s] = True
+        have_three_bwd = torch.zeros(S, dtype=torch.bool, device=dev)
+        for s in range(S):
+            if s + 2 < S and labels[s + 2] != blank and labels[s + 2] != labels[s]:
+                have_three_bwd[s] = True
+
+        # lp[t, label'[s]] for all t and s
+        lp_labels = lp[:inp_len, b, :].gather(
+            1, labels_t.unsqueeze(0).expand(inp_len, S))
+
+        # Forward alpha DP: la[t,s] = logaddexp3(la[t-1,s],la[t-1,s-1],la[t-1,s-2]) + lp[t,label'[s]]
+        la = torch.full((inp_len, S), NEG_INF, dtype=torch.float32, device=dev)
+        la[0, 0] = lp_labels[0, 0]
+        if S > 1:
+            la[0, 1] = lp_labels[0, 1]
+        for t in range(1, inp_len):
+            la1 = la[t - 1]
+            la2 = torch.full((S,), NEG_INF, dtype=torch.float32, device=dev)
+            if S > 1:
+                la2[1:] = la[t - 1, :S - 1]
+            la3 = torch.full((S,), NEG_INF, dtype=torch.float32, device=dev)
+            if S > 2:
+                la3[2:][have_three_fwd[2:]] = la[t - 1, :S - 2][have_three_fwd[2:]]
+            lamax = torch.max(la1, torch.max(la2, la3))
+            lamax = torch.where(lamax == NEG_INF, torch.zeros_like(lamax), lamax)
+            la[t] = (torch.log(torch.exp(la1 - lamax)
+                               + torch.exp(la2 - lamax)
+                               + torch.exp(la3 - lamax))
+                     + lamax + lp_labels[t])
+
+        # Loss (eq 8)
+        l1 = la[inp_len - 1, S - 1]
+        l2 = (la[inp_len - 1, S - 2] if S > 1
+              else torch.tensor(NEG_INF, dtype=torch.float32, device=dev))
+        m = torch.max(l1, l2)
+        m = torch.where(m == NEG_INF, torch.zeros_like(m), m)
+        log_p = torch.log(torch.exp(l1 - m) + torch.exp(l2 - m)) + m
+        nll = -log_p
+
+        # Backward beta DP (kernel convention: includes lp at each timestep)
+        lb = torch.full((inp_len, S), NEG_INF, dtype=torch.float32, device=dev)
+        lb[inp_len - 1, S - 1] = lp_labels[inp_len - 1, S - 1]
+        if S > 1:
+            lb[inp_len - 1, S - 2] = lp_labels[inp_len - 1, S - 2]
+        for t in range(inp_len - 2, -1, -1):
+            lb1 = lb[t + 1]
+            lb2 = torch.full((S,), NEG_INF, dtype=torch.float32, device=dev)
+            if S > 1:
+                lb2[:S - 1] = lb[t + 1, 1:]
+            lb3 = torch.full((S,), NEG_INF, dtype=torch.float32, device=dev)
+            if S > 2:
+                lb3[:S - 2][have_three_bwd[:S - 2]] = lb[t + 1, 2:][have_three_bwd[:S - 2]]
+            lbmax = torch.max(lb1, torch.max(lb2, lb3))
+            lbmax = torch.where(lbmax == NEG_INF, torch.zeros_like(lbmax), lbmax)
+            lb[t] = (torch.log(torch.exp(lb1 - lbmax)
+                               + torch.exp(lb2 - lbmax)
+                               + torch.exp(lb3 - lbmax))
+                     + lbmax + lp_labels[t])
+
+        # Gradient collection (naive collect kernel: sequential logaddexp over s)
+        collected = torch.full((inp_len, C), NEG_INF, dtype=torch.float32, device=dev)
+        for s in range(S):
+            c = labels[s]
+            log_ab = la[:, s] + lb[:, s]  # (inp_len,)
+            cur = collected[:, c]
+            is_neg = (cur == NEG_INF)
+            mx = torch.max(cur, log_ab)
+            safe = torch.log(torch.exp(cur - mx) + torch.exp(log_ab - mx)) + mx
+            collected[:, c] = torch.where(is_neg, log_ab, safe)
+
+        # gradient = exp(lp) - exp(collected + nll - lp)
+        lp_slice = lp[:inp_len, b, :]
+        grad_b = lp_slice.exp() - (collected + nll - lp_slice).exp()
+        grad[:inp_len, b, :] = grad_b
+        losses.append(nll)
+
+    # Mean reduction: divide by target_lengths then mean over batch
+    # Use CUDA tensor operations to match (res / target_lengths_t).mean()
+    loss_t = torch.stack(losses)  # (N,) float32 CUDA
+    tl_float = target_lengths[:N].float().clamp(min=1)
+    loss_t = loss_t / tl_float
+    mean_loss = loss_t.mean().item()
+    for b in range(N):
+        tl_b = float(tl_cpu[b].item())
+        grad[:, b, :] = grad[:, b, :] / tl_b
+    grad = grad / N
+    return mean_loss, grad
+
+
+def ref_cumprod_backward(grad, x, dim):
+    """Gradient of cumprod.  Uses the native aten decomposition which
+    decomposes into per-position prod/cumprod/sum calls (O(n^2) total)."""
+    return torch.ops.aten.cumprod_backward.default(
+        grad, x.detach(), dim, torch.cumprod(x.detach(), dim=dim))
+
+
+def ref_logcumsumexp_backward(grad, x, output, dim):
+    """Gradient of logcumsumexp.  Matches autograd decomposition:
+    split grad into positive/negative parts in log-space, reverse-logcumsumexp
+    each, add x, exp, then subtract."""
+    xf = x.detach().float()
+    gf = grad.detach().float()
+    of = output.detach().float()
+    NEG_INF = torch.tensor(-3.4028234663852886e+38, dtype=torch.float32,
+                           device=x.device)
+    abs_g = gf.abs()
+    log_abs_g = abs_g.log()
+    log_pos = torch.where(gf > 0, log_abs_g, NEG_INF)
+    log_neg = torch.where(gf < 0, log_abs_g, NEG_INF)
+    rev_pos = (log_pos - of).flip(dim)
+    exp_pos = (torch.logcumsumexp(rev_pos, dim=dim).flip(dim) + xf).exp()
+    rev_neg = (log_neg - of).flip(dim)
+    exp_neg = (torch.logcumsumexp(rev_neg, dim=dim).flip(dim) + xf).exp()
+    return exp_pos - exp_neg
+
+
+def ref_scatter_add_backward(grad, idx):
+    """Gradient of scatter_add w.r.t. src: gather from grad at idx."""
+    return grad.gather(0, idx)
+
+
+def ref_embedding_bag_backward_weight(grad_output, idx, offsets,
+                                       num_embeddings, embedding_dim):
+    """Gradient of embedding_bag(mode=sum) w.r.t. weight: scatter_add."""
+    dw = torch.zeros(num_embeddings, embedding_dim, device=grad_output.device,
+                     dtype=torch.float32)
+    num_bags = offsets.shape[0]
+    for bag in range(num_bags):
+        start = offsets[bag].item()
+        end = offsets[bag + 1].item() if bag + 1 < num_bags else idx.shape[0]
+        for j in range(start, end):
+            dw[idx[j].item()] += grad_output[bag].float()
+    return dw
+
+
+def ref_group_norm_backward(grad, x, mean_t, rstd_t, weight,
+                             num_groups):
+    """Full group norm backward: dx, dw, db."""
+    orig_shape = x.shape
+    B, C = orig_shape[0], orig_shape[1]
+    HxW = 1
+    for d in orig_shape[2:]:
+        HxW *= d
+    g = grad.detach().double().reshape(B, C, HxW)
+    xv = x.detach().double().reshape(B, C, HxW)
+    w = weight.detach().double()
+    cpg = C // num_groups
+
+    dx = torch.zeros_like(g)
+    dw = torch.zeros(C, device=x.device, dtype=torch.float64)
+    db = torch.zeros(C, device=x.device, dtype=torch.float64)
+
+    for bi in range(B):
+        for gi in range(num_groups):
+            cs, ce = gi * cpg, (gi + 1) * cpg
+            m = mean_t[bi, gi].double()
+            r = rstd_t[bi, gi].double()
+            gs = cpg * HxW
+            ds = torch.tensor(0.0, device=x.device, dtype=torch.float64)
+            db_l = torch.tensor(0.0, device=x.device, dtype=torch.float64)
+            for c in range(cs, ce):
+                xh = (xv[bi, c] - m) * r
+                ds += (g[bi, c] * w[c] * xh).sum()
+                db_l += (g[bi, c] * w[c]).sum()
+            for c in range(cs, ce):
+                xh = (xv[bi, c] - m) * r
+                dx[bi, c] = r * (w[c] * g[bi, c] - (db_l + xh * ds) / gs)
+
+    for c in range(C):
+        gi = c // cpg
+        for bi in range(B):
+            m = mean_t[bi, gi].double()
+            r = rstd_t[bi, gi].double()
+            xh = (xv[bi, c] - m) * r
+            dw[c] += (g[bi, c] * xh).sum()
+            db[c] += g[bi, c].sum()
+
+    return (dx.reshape(orig_shape).float(), dw.float(), db.float())
+
+
+def ref_batch_norm_backward(grad, x, mean_t, invstd_t, weight):
+    """Full batch norm backward: dx, dw, db."""
+    orig_shape = x.shape
+    B, C = orig_shape[0], orig_shape[1]
+    spatial = 1
+    for d in orig_shape[2:]:
+        spatial *= d
+    N = B * spatial
+    g = grad.detach().double().reshape(B, C, spatial)
+    xv = x.detach().double().reshape(B, C, spatial)
+    w = weight.detach().double()
+
+    dx = torch.zeros_like(g)
+    dw = torch.zeros(C, device=x.device, dtype=torch.float64)
+    db = torch.zeros(C, device=x.device, dtype=torch.float64)
+
+    for c in range(C):
+        m = mean_t[c].double()
+        ist = invstd_t[c].double()
+        xh = (xv[:, c, :] - m) * ist
+        sum_dy = g[:, c, :].sum()
+        sum_dy_xhat = (g[:, c, :] * xh).sum()
+        dw[c] = sum_dy_xhat
+        db[c] = sum_dy
+        dx[:, c, :] = w[c] * ist * (g[:, c, :] - (sum_dy + xh * sum_dy_xhat) / N)
+
+    return (dx.reshape(orig_shape).float(), dw.float(), db.float())
+
+
+def ref_avg_pool2d_backward(grad_output, input_shape, kH, kW,
+                             sH, sW, pH, pW, count_include_pad=False):
+    """Gradient of avg_pool2d matching CUDA kernel gather loop (float32).
+
+    The kernel computes each input gradient independently: for each input
+    position, iterate over contributing output positions and accumulate
+    top_diff[ph][pw] / divide_factor in float32.
+    """
+    B, C, iH, iW = input_shape
+    oH = (iH + 2 * pH - kH) // sH + 1
+    oW = (iW + 2 * pW - kW) // sW + 1
+    g_list = grad_output.detach().cpu().tolist()
+    dx = [[[[0.0] * iW for _ in range(iH)] for _ in range(C)]
+          for _ in range(B)]
+    for b in range(B):
+        for c in range(C):
+            for ih in range(iH):
+                for iw in range(iW):
+                    h = ih + pH
+                    w = iw + pW
+                    phstart = 0 if h < kH else (h - kH) // sH + 1
+                    phend = min(h // sH + 1, oH)
+                    pwstart = 0 if w < kW else (w - kW) // sW + 1
+                    pwend = min(w // sW + 1, oW)
+                    gradient = _f32(0.0)
+                    for ph in range(phstart, phend):
+                        for pw in range(pwstart, pwend):
+                            hstart = ph * sH - pH
+                            wstart = pw * sW - pW
+                            hend = min(hstart + kH, iH + pH)
+                            wend = min(wstart + kW, iW + pW)
+                            if count_include_pad:
+                                divide_factor = (hend - hstart) * (wend - wstart)
+                            else:
+                                hs = max(hstart, 0)
+                                ws = max(wstart, 0)
+                                he = min(hend, iH)
+                                we = min(wend, iW)
+                                divide_factor = (he - hs) * (we - ws)
+                            gradient = _f32(gradient + _f32(
+                                g_list[b][c][ph][pw] / divide_factor))
+                    dx[b][c][ih][iw] = gradient
+    return torch.tensor(dx, device=grad_output.device, dtype=torch.float32)
+
+
+def ref_adaptive_avg_pool2d_backward(grad_output, input_shape):
+    """Gradient of adaptive_avg_pool2d(x, (1,1)): grad / (H*W)."""
+    B, C, H, W = input_shape
+    g = grad_output.detach().float()
+    dx = torch.zeros(input_shape, device=grad_output.device, dtype=torch.float32)
+    for b in range(B):
+        for c in range(C):
+            dx[b, c, :, :] = g[b, c, 0, 0] / (H * W)
+    return dx
+
+
+def ref_segment_reduce_sum_1d(data, lengths):
+    """CUB DeviceSegmentedReduce::Reduce — opaque tree reduction."""
+    d64 = data.detach().double()
+    n_seg = lengths.shape[0]
+    result = torch.zeros(n_seg, device=data.device, dtype=torch.float64)
+    off = 0
+    for i in range(n_seg):
+        length = lengths[i].item()
+        for j in range(length):
+            result[i] += d64[off + j]
+        off += length
+    return result.float()
+
+
+def ref_segment_reduce_sum_2d(data, lengths):
+    """segment_reduce_forward_kernel: one thread per (segment, feature),
+    sequential float32 accumulation."""
+    d = data.detach().cpu().tolist()
+    n_seg = lengths.shape[0]
+    n_feat = data.shape[1]
+    result = [[_f32(0.0)] * n_feat for _ in range(n_seg)]
+    off = 0
+    for i in range(n_seg):
+        length = lengths[i].item()
+        for f in range(n_feat):
+            acc = _f32(0.0)
+            for j in range(length):
+                acc = _f32(acc + d[off + j][f])
+            result[i][f] = acc
+        off += length
+    return torch.tensor(result, device=data.device, dtype=torch.float32)
+
+
+def ref_foreach_norm_l2(t):
+    """ForeachReduceOp.cu L2 norm: kBlockSize=512, kILP=4, BlockReduceSum.
+
+    Aligned path: thread tid loads elements [tid*4 .. tid*4+3], accumulates
+    4 independent squared values, then sums them left-to-right.
+    BlockReduceSum across 512 threads, then sqrt.
+    """
+    import math
+    vals = t.detach().cpu().tolist()
+    n = len(vals)
+    BLOCK = 512
+    ILP = 4
+    thread_vals = [_f32(0.0)] * BLOCK
+    for tid in range(BLOCK):
+        accs = [_f32(0.0)] * ILP
+        base = tid * ILP
+        if base < n:
+            for ii in range(ILP):
+                idx = base + ii
+                if idx < n:
+                    v = _f32(vals[idx])
+                    accs[ii] = _f32(accs[ii] + _f32(v * v))
+        val = _f32(0.0)
+        for ii in range(ILP):
+            val = _f32(val + accs[ii])
+        thread_vals[tid] = val
+    total = block_reduce_cuh(
+        thread_vals, lambda a, b: _f32(a + b), _f32(0.0))
+    return _f32(math.sqrt(float(total)))
 
 
 class TestReduceSumProdKernel(TestCase):
@@ -1834,10 +2836,10 @@ class TestReduceSumProdKernel(TestCase):
         result = torch.sum(x, dim=-1)
         self.assertEqual(result.shape, (100,))
         # Spec: bitwise match (gpu_reduce_kernel vectorized path)
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         for i in range(result.shape[0]):
-            row = list(x[i].cpu().numpy())
-            spec_val = spec_gpu_reduce_kernel(row, add, np.float32(0.0), num_outputs=100, stride1=True)
+            row = x[i].cpu().tolist()
+            spec_val = spec_gpu_reduce_kernel(row, add, _f32(0.0), num_outputs=100, stride1=True)
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
 
     def test_sum_nonstride1_split(self):
@@ -1847,7 +2849,7 @@ class TestReduceSumProdKernel(TestCase):
         x = torch.randn(5000, 97, device="cuda")
         result = torch.sum(x, dim=0)
         self.assertEqual(result.shape, (97,))
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         props = torch.cuda.get_device_properties(0)
         W, H, S, do_bx, do_by, vec, ctas = gpu_reduce_config(
             5000, 97, stride1=False, num_sms=props.multi_processor_count,
@@ -1855,17 +2857,17 @@ class TestReduceSumProdKernel(TestCase):
             output_vec_size=1,
         )
         for i in range(min(4, result.shape[0])):
-            col = list(x[:, i].cpu().numpy())
+            col = x[:, i].cpu().tolist()
             if ctas > 1:
                 spec_val = spec_gpu_reduce_kernel_global(
-                    col, add, np.float32(0.0), num_outputs=97, stride1=False,
+                    col, add, _f32(0.0), num_outputs=97, stride1=False,
                     vt0=4, warp_size=32, max_threads=512, rocm=False,
                     W=W, H=H, S=S, do_bx=do_bx, do_by=do_by,
                     vectorize=vec, ctas_per_output=ctas,
                 )
             else:
                 spec_val = spec_gpu_reduce_kernel(
-                    col, add, np.float32(0.0), num_outputs=97, stride1=False,
+                    col, add, _f32(0.0), num_outputs=97, stride1=False,
                 )
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
 
@@ -1877,10 +2879,10 @@ class TestReduceSumProdKernel(TestCase):
         result = torch.sum(x, dim=0)
         self.assertEqual(result.shape, (100,))
         # Spec: bitwise match (non-stride-1, no split, purely sequential)
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         for i in range(min(4, result.shape[0])):
-            col = list(x[:, i].cpu().numpy())
-            spec_val = spec_gpu_reduce_kernel(col, add, np.float32(0.0), num_outputs=100, stride1=False)
+            col = x[:, i].cpu().tolist()
+            spec_val = spec_gpu_reduce_kernel(col, add, _f32(0.0), num_outputs=100, stride1=False)
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
 
     def test_sum_global_reduce(self):
@@ -1891,24 +2893,24 @@ class TestReduceSumProdKernel(TestCase):
         x = torch.randn(50000, 97, device="cuda")
         result = torch.sum(x, dim=0)
         self.assertEqual(result.shape, (97,))
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         props = torch.cuda.get_device_properties(0)
         W, H, S, do_bx, do_by, vec, ctas = gpu_reduce_config(
             50000, 97, stride1=False, num_sms=props.multi_processor_count,
             max_threads_per_sm=props.max_threads_per_multi_processor,
             output_vec_size=1,
         )
-        col = list(x[:, 0].cpu().numpy())
+        col = x[:, 0].cpu().tolist()
         if ctas > 1:
             spec_val = spec_gpu_reduce_kernel_global(
-                col, add, np.float32(0.0), num_outputs=97, stride1=False,
+                col, add, _f32(0.0), num_outputs=97, stride1=False,
                 vt0=4, warp_size=32, max_threads=512, rocm=False,
                 W=W, H=H, S=S, do_bx=do_bx, do_by=do_by,
                 vectorize=vec, ctas_per_output=ctas,
             )
         else:
             spec_val = spec_gpu_reduce_kernel(
-                col, add, np.float32(0.0), num_outputs=97, stride1=False,
+                col, add, _f32(0.0), num_outputs=97, stride1=False,
             )
         self.assertEqual(spec_val, result[0].item(), atol=0, rtol=0)
 
@@ -1919,11 +2921,11 @@ class TestReduceSumProdKernel(TestCase):
         result = torch.nansum(x, dim=-1)
         self.assertEqual(result.shape, (100,))
         # Spec: nansum treats NaN as 0 in the reduce step, then combines via a+b.
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         for i in range(min(4, result.shape[0])):
-            row = list(x[i].cpu().numpy())
-            row_no_nan = [np.float32(0) if np.isnan(v) else v for v in row]
-            spec_val = spec_gpu_reduce_kernel(row_no_nan, add, np.float32(0.0), num_outputs=100, stride1=True)
+            row = x[i].cpu().tolist()
+            row_no_nan = [_f32(0) if math.isnan(float(v)) else v for v in row]
+            spec_val = spec_gpu_reduce_kernel(row_no_nan, add, _f32(0.0), num_outputs=100, stride1=True)
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
 
     def test_prod_stride1(self):
@@ -1932,10 +2934,10 @@ class TestReduceSumProdKernel(TestCase):
         result = torch.prod(x, dim=-1)
         self.assertEqual(result.shape, (100,))
         # Spec: bitwise match (gpu_reduce_kernel vectorized path, multiply)
-        mul = lambda a, b: a * b
+        mul = lambda a, b: _f32(a * b)
         for i in range(min(4, result.shape[0])):
-            row = list(x[i].cpu().numpy())
-            spec_val = spec_gpu_reduce_kernel(row, mul, np.float32(1.0), num_outputs=100, stride1=True)
+            row = x[i].cpu().tolist()
+            spec_val = spec_gpu_reduce_kernel(row, mul, _f32(1.0), num_outputs=100, stride1=True)
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
 
     def test_prod_nonstride1(self):
@@ -1943,11 +2945,37 @@ class TestReduceSumProdKernel(TestCase):
         result = torch.prod(x, dim=0)
         self.assertEqual(result.shape, (100,))
         # Spec: bitwise match (non-stride-1, split across warps, multiply)
-        mul = lambda a, b: a * b
+        mul = lambda a, b: _f32(a * b)
         for i in range(min(4, result.shape[0])):
-            col = list(x[:, i].cpu().numpy())
-            spec_val = spec_gpu_reduce_kernel(col, mul, np.float32(1.0), num_outputs=100, stride1=False)
+            col = x[:, i].cpu().tolist()
+            spec_val = spec_gpu_reduce_kernel(col, mul, _f32(1.0), num_outputs=100, stride1=False)
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
+
+    def test_sum_backward(self):
+        x = torch.randn(100, 5000, device="cuda", requires_grad=True)
+        result = torch.sum(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = grad.unsqueeze(-1).expand_as(x)
+        self.assertEqual(x.grad, ref, atol=0, rtol=0)
+
+    def test_prod_backward(self):
+        x = torch.randn(10, 100, device="cuda", requires_grad=True)
+        result = torch.prod(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_prod_backward(grad, x)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
+
+    def test_nansum_backward(self):
+        x = torch.randn(100, 5000, device="cuda", requires_grad=True)
+        x.data[0, 0] = float("nan")
+        result = torch.nansum(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = grad.unsqueeze(-1).expand_as(x).clone()
+        ref[x.isnan()] = 0
+        self.assertEqual(x.grad, ref, atol=0, rtol=0)
 
 
 class TestReduceMomentKernel(TestCase):
@@ -1967,13 +2995,13 @@ class TestReduceMomentKernel(TestCase):
         result = torch.mean(x, dim=-1)
         self.assertEqual(result.shape, (100,))
         # mean uses same gpu_reduce_kernel tree as sum, with project *= 1/N
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         for i in range(min(4, result.shape[0])):
-            row = list(x[i].cpu().numpy())
-            spec_sum = spec_gpu_reduce_kernel(row, add, np.float32(0.0), num_outputs=100, stride1=True)
-            # MeanOps::project multiplies by precomputed factor = 1/N
-            factor = 1.0 / len(row)
-            spec_mean = spec_sum * factor
+            row = x[i].cpu().tolist()
+            spec_sum = spec_gpu_reduce_kernel(row, add, _f32(0.0), num_outputs=100, stride1=True)
+            # MeanOps::project multiplies by precomputed factor = 1/N (in float32)
+            factor = _f32(1.0 / _f32(len(row)))
+            spec_mean = _f32(spec_sum * factor)
             self.assertEqual(spec_mean, result[i].item(), atol=0, rtol=0)
 
     def test_mean_nonstride1(self):
@@ -1981,7 +3009,7 @@ class TestReduceMomentKernel(TestCase):
         x = torch.randn(5000, 97, device="cuda")
         result = torch.mean(x, dim=0)
         self.assertEqual(result.shape, (97,))
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         props = torch.cuda.get_device_properties(0)
         W, H, S, do_bx, do_by, vec, ctas = gpu_reduce_config(
             5000, 97, stride1=False, num_sms=props.multi_processor_count,
@@ -1989,21 +3017,21 @@ class TestReduceMomentKernel(TestCase):
             output_vec_size=1,
         )
         for i in range(min(4, result.shape[0])):
-            col = list(x[:, i].cpu().numpy())
+            col = x[:, i].cpu().tolist()
             if ctas > 1:
                 spec_sum = spec_gpu_reduce_kernel_global(
-                    col, add, np.float32(0.0), num_outputs=97, stride1=False,
+                    col, add, _f32(0.0), num_outputs=97, stride1=False,
                     vt0=4, warp_size=32, max_threads=512, rocm=False,
                     W=W, H=H, S=S, do_bx=do_bx, do_by=do_by,
                     vectorize=vec, ctas_per_output=ctas,
                 )
             else:
                 spec_sum = spec_gpu_reduce_kernel(
-                    col, add, np.float32(0.0), num_outputs=97, stride1=False,
+                    col, add, _f32(0.0), num_outputs=97, stride1=False,
                 )
-            # MeanOps::project multiplies by precomputed factor = 1/N (not division)
-            factor = 1.0 / len(col)
-            spec_mean = spec_sum * factor
+            # MeanOps::project multiplies by precomputed factor = 1/N (in float32)
+            factor = _f32(1.0 / _f32(len(col)))
+            spec_mean = _f32(spec_sum * factor)
             self.assertEqual(spec_mean, result[i].item(), atol=0, rtol=0)
 
     def test_var_stride1(self):
@@ -2013,11 +3041,11 @@ class TestReduceMomentKernel(TestCase):
         x = torch.randn(100, 5000, device="cuda")
         result = torch.var(x, dim=-1)
         self.assertEqual(result.shape, (100,))
-        # torch.var default is Bessel-corrected (correction=1); compare against np.var with ddof=1.
+        # torch.var default is Bessel-corrected (correction=1).
         # gpu_reduce_kernel uses WelfordOps::combine (not cuWelfordCombine) which
         # has FMA opportunities in the 4-tuple merge that we can't compile without
         # reimplementing the full WelfordOps specialization for gpu_reduce_kernel.
-        ref = float(np.var(x[0].cpu().numpy(), ddof=1))
+        ref = x[0].double().var(correction=1).item()
         self.assertEqual(ref, result[0].item(), atol=1e-6, rtol=0)
 
     def test_std_nonstride1(self):
@@ -2025,8 +3053,32 @@ class TestReduceMomentKernel(TestCase):
         x = torch.randn(5000, 100, device="cuda")
         result = torch.std(x, dim=0)
         self.assertEqual(result.shape, (100,))
-        ref = float(np.std(x[:, 0].cpu().numpy(), ddof=1))
+        ref = x[:, 0].double().std(correction=1).item()
         self.assertEqual(ref, result[0].item(), atol=1e-6, rtol=0)
+
+    def test_mean_backward(self):
+        x = torch.randn(100, 5000, device="cuda", requires_grad=True)
+        result = torch.mean(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = grad.unsqueeze(-1).expand_as(x) / x.shape[-1]
+        self.assertEqual(x.grad, ref, atol=0, rtol=0)
+
+    def test_var_backward(self):
+        x = torch.randn(100, 5000, device="cuda", requires_grad=True)
+        result = torch.var(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_var_backward(grad, x)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
+
+    def test_std_backward(self):
+        x = torch.randn(100, 5000, device="cuda", requires_grad=True)
+        result = torch.std(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_std_backward(grad, x)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
 
 
 class TestReduceNormKernel(TestCase):
@@ -2047,11 +3099,11 @@ class TestReduceNormKernel(TestCase):
         result = torch.linalg.vector_norm(x, 1, dim=-1)
         self.assertEqual(result.shape, (100,))
         # L1 norm: reduce is a + |b|, combine is a + b, project is identity
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         for i in range(min(4, result.shape[0])):
-            row = list(x[i].cpu().numpy())
-            abs_row = [np.float32(abs(v)) for v in row]
-            spec_val = spec_gpu_reduce_kernel(abs_row, add, np.float32(0.0), num_outputs=100, stride1=True)
+            row = x[i].cpu().tolist()
+            abs_row = [_f32(abs(v)) for v in row]
+            spec_val = spec_gpu_reduce_kernel(abs_row, add, _f32(0.0), num_outputs=100, stride1=True)
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
 
     def test_norm_l2_stride1(self):
@@ -2059,11 +3111,11 @@ class TestReduceNormKernel(TestCase):
         result = torch.linalg.vector_norm(x, 2, dim=-1)
         self.assertEqual(result.shape, (100,))
         # L2 norm: reduce is a + b^2, combine is a + b, project is sqrt
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         for i in range(min(4, result.shape[0])):
-            row = list(x[i].cpu().numpy())
+            row = x[i].cpu().tolist()
             sq_row = [v * v for v in row]
-            spec_sumsq = spec_gpu_reduce_kernel(sq_row, add, np.float32(0.0), num_outputs=100, stride1=True)
+            spec_sumsq = spec_gpu_reduce_kernel(sq_row, add, _f32(0.0), num_outputs=100, stride1=True)
             # Use CUDA sqrt to match kernel's device_sqrt
             spec_norm = torch.tensor(float(spec_sumsq), dtype=torch.float32, device="cuda").sqrt().item()
             self.assertEqual(spec_norm, result[i].item(), atol=0, rtol=0)
@@ -2073,14 +3125,30 @@ class TestReduceNormKernel(TestCase):
         result = torch.linalg.vector_norm(x, 3.0, dim=0)
         self.assertEqual(result.shape, (100,))
         # Lp norm: reduce is a + |b|^p, combine is a + b, project is ^(1/p)
-        add = lambda a, b: a + b
+        add = lambda a, b: _f32(a + b)
         for i in range(min(4, result.shape[0])):
-            col = list(x[:, i].cpu().numpy())
-            abs_p_col = [np.float32(abs(v) ** 3) for v in col]
-            spec_sum = spec_gpu_reduce_kernel(abs_p_col, add, np.float32(0.0), num_outputs=100, stride1=False)
+            col = x[:, i].cpu().tolist()
+            abs_p_col = [_f32(abs(v) ** 3) for v in col]
+            spec_sum = spec_gpu_reduce_kernel(abs_p_col, add, _f32(0.0), num_outputs=100, stride1=False)
             # Use CUDA pow to match kernel's device_pow
             spec_val = torch.tensor(float(spec_sum), dtype=torch.float32, device="cuda").pow(1.0 / 3.0).item()
             self.assertEqual(spec_val, result[i].item(), atol=0, rtol=0)
+
+    def test_norm_l2_backward(self):
+        x = torch.randn(100, 5000, device="cuda", requires_grad=True)
+        result = torch.linalg.vector_norm(x, 2, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_norm_l2_backward(grad, x)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
+
+    def test_norm_lp_backward(self):
+        x = torch.randn(5000, 100, device="cuda", requires_grad=True)
+        result = torch.linalg.vector_norm(x, 3.0, dim=0)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_norm_lp_backward(grad, x, 3.0)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
 
 
 class TestSoftMax(TestCase):
@@ -2128,12 +3196,12 @@ class TestSoftMax(TestCase):
         x = torch.randn(4, 64, device="cuda")
         result = torch.softmax(x, dim=-1)
         self.assertEqual(result.shape, x.shape)
-        # Spec: bitwise match (CUDA exp via dtype=np.float32)
+        # Spec: bitwise match (CUDA exp via dtype=torch.float32)
         for i in range(x.shape[0]):
-            row = list(x[i].cpu().numpy())
-            spec_out = spec_softmax_persistent(row, warp_size=32, dtype=np.float32)
+            row = x[i].cpu().tolist()
+            spec_out = spec_softmax_persistent(row, warp_size=32, dtype=torch.float32)
             self.assertEqual(
-                torch.tensor(np.array(spec_out, dtype=np.float32)),
+                torch.tensor(spec_out, dtype=torch.float32),
                 result[i].cpu(),
                 atol=0, rtol=0,
             )
@@ -2148,10 +3216,10 @@ class TestSoftMax(TestCase):
         self.assertEqual(result.shape, x.shape)
         # Spec: bitwise (CUDA exp, correct ILP grouping, non-Smem path)
         for i in range(x.shape[0]):
-            row = list(x[i].cpu().numpy())
-            spec_out = spec_softmax_inner(row, block_size=1024, dtype=np.float32)
+            row = x[i].cpu().tolist()
+            spec_out = spec_softmax_inner(row, block_size=1024, dtype=torch.float32)
             self.assertEqual(
-                torch.tensor(np.array(spec_out, dtype=np.float32)),
+                torch.tensor(spec_out, dtype=torch.float32),
                 result[i].cpu(),
                 atol=0, rtol=0,
             )
@@ -2163,11 +3231,11 @@ class TestSoftMax(TestCase):
         result = torch.softmax(x, dim=0)
         self.assertEqual(result.shape, x.shape)
         # Spec: bitwise (CUDA exp, correct spatialBlockReduceX tree)
-        x_np = x.cpu().numpy()
-        flat_data = [x_np[d, inner] for d in range(x.shape[0]) for inner in range(x.shape[1])]
+        x_list = x.cpu().tolist()
+        flat_data = [x_list[d][inner] for d in range(x.shape[0]) for inner in range(x.shape[1])]
         spec_out = spec_softmax_spatial(flat_data, dim_size=x.shape[0],
-                                        inner_size=x.shape[1], dtype=np.float32)
-        spec_t = torch.tensor(np.array(spec_out, dtype=np.float32)).reshape(x.shape)
+                                        inner_size=x.shape[1], dtype=torch.float32)
+        spec_t = torch.tensor(spec_out, dtype=torch.float32).reshape(x.shape)
         self.assertEqual(spec_t, result.cpu(), atol=0, rtol=0)
 
     def test_log_softmax_inner(self):
@@ -2179,10 +3247,10 @@ class TestSoftMax(TestCase):
         self.assertEqual(result.shape, x.shape)
         # Reuse softmax_inner spec to get matching max and sum, then apply
         # log_softmax epilogue: output = x - max - log(sum_exp).
-        exp = _dtype_exp(np.float32)
-        cast = np.float32
+        exp = _dtype_exp(torch.float32)
+        cast = _f32
         for i in range(x.shape[0]):
-            row = list(x[i].cpu().numpy())
+            row = x[i].cpu().tolist()
             n = len(row)
             B = 1024
             ILP = 4
@@ -2213,20 +3281,20 @@ class TestSoftMax(TestCase):
                 offset = tid
                 while offset * ILP < main_end:
                     for j in range(ILP):
-                        acc = acc + exp_data[offset * ILP + j]
+                        acc = cast(acc + exp_data[offset * ILP + j])
                     offset += B
                 tail_offset = main_end + tid
                 while tail_offset < n:
-                    acc = acc + exp_data[tail_offset]
+                    acc = cast(acc + exp_data[tail_offset])
                     tail_offset += B
                 thread_sums[tid] = acc
-            row_sum = block_reduce_cuh(thread_sums, lambda a, b: a + b, zero)
+            row_sum = block_reduce_cuh(thread_sums, lambda a, b: cast(a + b), zero)
             # Epilogue: x - max - log(sum) using CUDA log
             log_sum = torch.tensor(float(row_sum), dtype=torch.float32,
                                    device="cuda").log().item()
-            spec_out = [cast(v) - cast(row_max) - cast(log_sum) for v in row]
+            spec_out = [cast(cast(cast(v) - cast(row_max)) - cast(log_sum)) for v in row]
             self.assertEqual(
-                torch.tensor(np.array(spec_out, dtype=np.float32)),
+                torch.tensor(spec_out, dtype=torch.float32),
                 result[i].cpu(),
                 atol=0, rtol=0,
             )
@@ -2243,12 +3311,12 @@ class TestSoftMax(TestCase):
         B = 1024
         ILP = 4
         for i in range(x.shape[0]):
-            g = list(grad[i].cpu().numpy())
-            o = list(output[i].cpu().numpy())
+            g = grad[i].cpu().tolist()
+            o = output[i].cpu().tolist()
             n = len(g)
-            cast = np.float32
+            cast = _f32
             zero = cast(0.0)
-            tmp = [cast(g[j]) * cast(o[j]) for j in range(n)]
+            tmp = [cast(cast(g[j]) * cast(o[j])) for j in range(n)]
             # ilpReduce for sum(tmp)
             last = n % (ILP * B)
             main_end = n - last
@@ -2258,14 +3326,14 @@ class TestSoftMax(TestCase):
                 offset = tid
                 while offset * ILP < main_end:
                     for j in range(ILP):
-                        acc = acc + tmp[offset * ILP + j]
+                        acc = cast(acc + tmp[offset * ILP + j])
                     offset += B
                 tail_offset = main_end + tid
                 while tail_offset < n:
-                    acc = acc + tmp[tail_offset]
+                    acc = cast(acc + tmp[tail_offset])
                     tail_offset += B
                 thread_sums[tid] = acc
-            row_sum = block_reduce_cuh(thread_sums, lambda a, b: a + b, zero)
+            row_sum = block_reduce_cuh(thread_sums, lambda a, b: cast(a + b), zero)
             # Compiled epilogue for FMA: tmp - output * sum
             sum_t = torch.tensor(float(row_sum), device="cuda", dtype=torch.float32)
             spec_gi = []
@@ -2276,7 +3344,7 @@ class TestSoftMax(TestCase):
             # 97% bitwise; remaining 3% have sub-ULP diffs (~1e-11) from
             # ~2 ULP sum divergence in kernel's AddFloat ilpReduce.
             self.assertEqual(
-                torch.tensor(np.array(spec_gi, dtype=np.float32)),
+                torch.tensor(spec_gi, dtype=torch.float32),
                 result[i].cpu(),
                 atol=2e-11, rtol=0,
             )
@@ -2295,9 +3363,9 @@ class TestSoftMax(TestCase):
         # Spec: pre-multiply tmp, reduce sum(tmp) per inner position via
         # shmem_halving_reduce (same dim_threads as spec_softmax_spatial),
         # then apply epilogue.
-        grad_np = grad.cpu().numpy()
-        out_np = output.cpu().numpy()
-        cast = np.float32
+        grad_list = grad.cpu().tolist()
+        out_list = output.cpu().tolist()
+        cast = _f32
 
         max_block = 1024
         inner_threads = min(inner_size, max_block)
@@ -2307,30 +3375,30 @@ class TestSoftMax(TestCase):
                 dim_threads *= 2
             dim_threads //= 2
 
-        spec_grad_input = np.zeros_like(grad_np)
+        spec_grad_input = [[0.0] * inner_size for _ in range(dim_size)]
         for inner in range(inner_size):
-            tmp = [cast(grad_np[d, inner]) * cast(out_np[d, inner])
+            tmp = [cast(cast(grad_list[d][inner]) * cast(out_list[d][inner]))
                    for d in range(dim_size)]
             if dim_threads == 1:
                 s = cast(0.0)
                 for d in range(dim_size):
-                    s = s + tmp[d]
+                    s = cast(s + tmp[d])
             else:
                 thread_sums = [cast(0.0)] * dim_threads
                 for tx in range(dim_threads):
                     for d in range(tx, dim_size, dim_threads):
-                        thread_sums[tx] = thread_sums[tx] + tmp[d]
-                s = shmem_halving_reduce(thread_sums, lambda a, b: a + b,
+                        thread_sums[tx] = cast(thread_sums[tx] + tmp[d])
+                s = shmem_halving_reduce(thread_sums, lambda a, b: cast(a + b),
                                          cast(0.0))
             # Compiled epilogue for FMA: tmp - output * sum
             s_t = torch.tensor(float(s), device="cuda", dtype=torch.float32)
             for d in range(dim_size):
                 tmp_t = torch.tensor(float(tmp[d]), device="cuda", dtype=torch.float32)
-                out_t = torch.tensor(float(out_np[d, inner]), device="cuda", dtype=torch.float32)
-                spec_grad_input[d, inner] = _compiled_softmax_backward_epilogue(
+                out_t = torch.tensor(float(out_list[d][inner]), device="cuda", dtype=torch.float32)
+                spec_grad_input[d][inner] = _compiled_softmax_backward_epilogue(
                     tmp_t, out_t, s_t).item()
 
-        spec_t = torch.tensor(spec_grad_input)
+        spec_t = torch.tensor(spec_grad_input, dtype=torch.float32)
         self.assertEqual(spec_t, result.cpu(), atol=0, rtol=0)
 
     def test_log_softmax_backward(self):
@@ -2344,14 +3412,14 @@ class TestSoftMax(TestCase):
             grad, output, -1, x.dtype
         )
         self.assertEqual(result.shape, x.shape)
-        exp = _dtype_exp(np.float32)
+        exp = _dtype_exp(torch.float32)
         B = 1024
         ILP = 4
         for i in range(x.shape[0]):
-            g = list(grad[i].cpu().numpy())
-            o = list(output[i].cpu().numpy())
+            g = grad[i].cpu().tolist()
+            o = output[i].cpu().tolist()
             n = len(g)
-            cast = np.float32
+            cast = _f32
             zero = cast(0.0)
             # ilpReduce for sum(grad)
             last = n % (ILP * B)
@@ -2362,14 +3430,14 @@ class TestSoftMax(TestCase):
                 offset = tid
                 while offset * ILP < main_end:
                     for j in range(ILP):
-                        acc = acc + g[offset * ILP + j]
+                        acc = cast(acc + g[offset * ILP + j])
                     offset += B
                 tail_offset = main_end + tid
                 while tail_offset < n:
-                    acc = acc + g[tail_offset]
+                    acc = cast(acc + g[tail_offset])
                     tail_offset += B
                 thread_sums[tid] = acc
-            row_sum = block_reduce_cuh(thread_sums, lambda a, b: a + b, zero)
+            row_sum = block_reduce_cuh(thread_sums, lambda a, b: cast(a + b), zero)
             # Epilogue: grad - exp(output) * sum(grad)
             # exp(log_softmax_output) is computed via CUDA exp
             sum_t = torch.tensor(float(row_sum), device="cuda", dtype=torch.float32)
@@ -2381,7 +3449,7 @@ class TestSoftMax(TestCase):
                 spec_gi.append(_compiled_softmax_backward_epilogue(g_t, exp_o, sum_t).item())
             # exp(log_softmax_output) introduces ~1 ULP per element + sum divergence.
             self.assertEqual(
-                torch.tensor(np.array(spec_gi, dtype=np.float32)),
+                torch.tensor(spec_gi, dtype=torch.float32),
                 result[i].cpu(),
                 atol=3e-7, rtol=0,
             )
@@ -2401,24 +3469,24 @@ class TestSoftMax(TestCase):
         # Spec: pre-multiply tmp = grad*output, per-lane sequential sum (ILP
         # grouping like forward), butterfly for sum, epilogue: tmp - output*sum.
         for i in range(x.shape[0]):
-            g = list(grad[i].cpu().numpy())
-            o = list(output[i].cpu().numpy())
+            g = grad[i].cpu().tolist()
+            o = output[i].cpu().tolist()
             n = len(g)
-            cast = np.float32
+            cast = _f32
             zero = cast(0.0)
 
-            tmp = [cast(g[j]) * cast(o[j]) for j in range(n)]
+            tmp = [cast(cast(g[j]) * cast(o[j])) for j in range(n)]
 
             # Per-lane sequential sum at stride warp_size
             lane_sums = [zero] * warp_size
             for lane in range(warp_size):
                 acc = zero
                 for it_idx in range(lane, n, warp_size):
-                    acc = acc + tmp[it_idx]
+                    acc = cast(acc + tmp[it_idx])
                 lane_sums[lane] = acc
 
             row_sum = shfl_xor_butterfly_high_to_low(
-                lane_sums, lambda a, b: a + b
+                lane_sums, lambda a, b: cast(a + b)
             )
 
             # Compiled epilogue for FMA: tmp - output * sum
@@ -2429,7 +3497,7 @@ class TestSoftMax(TestCase):
                 ov = torch.tensor(float(o[j]), device="cuda", dtype=torch.float32)
                 spec_gi.append(_compiled_softmax_backward_epilogue(t, ov, sum_t).item())
             self.assertEqual(
-                torch.tensor(np.array(spec_gi, dtype=np.float32)),
+                torch.tensor(spec_gi, dtype=torch.float32),
                 result[i].cpu(),
                 atol=0, rtol=0,
             )
@@ -2441,9 +3509,9 @@ class TestSoftMax(TestCase):
         x = torch.randn(1000, 32, device="cuda")
         result = torch.log_softmax(x, dim=0)
         self.assertEqual(result.shape, x.shape)
-        exp = _dtype_exp(np.float32)
-        cast = np.float32
-        x_np = x.cpu().numpy()
+        exp = _dtype_exp(torch.float32)
+        cast = _f32
+        x_list = x.cpu().tolist()
         dim_size, inner_size = x.shape
         # Compute dim_threads matching SpatialSoftMax_getBlockSize
         max_block = 1024
@@ -2457,31 +3525,56 @@ class TestSoftMax(TestCase):
             if dim_threads == 1:
                 m = cast(float("-inf"))
                 for d in range(dim_size):
-                    m = max(m, x_np[d, inner])
+                    m = max(m, x_list[d][inner])
                 s = cast(0.0)
                 for d in range(dim_size):
-                    s = s + exp(cast(x_np[d, inner]) - cast(m))
+                    s = cast(s + exp(cast(x_list[d][inner]) - cast(m)))
             else:
                 neg_inf = cast(float("-inf"))
                 thread_maxes = [neg_inf] * dim_threads
                 for tx in range(dim_threads):
                     for d in range(tx, dim_size, dim_threads):
-                        thread_maxes[tx] = max(thread_maxes[tx], x_np[d, inner])
+                        thread_maxes[tx] = max(thread_maxes[tx], x_list[d][inner])
                 m = shmem_halving_reduce(thread_maxes, max, neg_inf)
                 zero = cast(0.0)
                 thread_sums = [zero] * dim_threads
                 for tx in range(dim_threads):
                     for d in range(tx, dim_size, dim_threads):
-                        thread_sums[tx] = thread_sums[tx] + exp(
-                            cast(x_np[d, inner]) - cast(m))
-                s = shmem_halving_reduce(thread_sums, lambda a, b: a + b, zero)
+                        thread_sums[tx] = cast(thread_sums[tx] + exp(
+                            cast(x_list[d][inner]) - cast(m)))
+                s = shmem_halving_reduce(thread_sums, lambda a, b: cast(a + b), zero)
             # CUDA log for log(sum_exp)
             log_s = torch.tensor(float(s), dtype=torch.float32,
                                  device="cuda").log().item()
             for d in range(dim_size):
-                spec_val = cast(x_np[d, inner]) - cast(m) - cast(log_s)
+                spec_val = cast(cast(cast(x_list[d][inner]) - cast(m)) - cast(log_s))
                 self.assertEqual(float(spec_val), result[d, inner].item(),
                                  atol=0, rtol=0)
+
+    def test_log_softmax_backward_spatial(self):
+        # log_softmax backward on non-last dim -> spatial path.
+        # sum(grad) per inner position, then grad - exp(output) * sum(grad).
+        dim_size, inner_size = 1000, 32
+        x = torch.randn(dim_size, inner_size, device="cuda")
+        output = torch.log_softmax(x, dim=0)
+        grad = torch.randn_like(output)
+        result = torch.ops.aten._log_softmax_backward_data(
+            grad, output, 0, x.dtype
+        )
+        self.assertEqual(result.shape, x.shape)
+        grad_list = grad.cpu().tolist()
+        out_list = output.cpu().tolist()
+        flat_grad = [grad_list[d][inner]
+                     for d in range(dim_size) for inner in range(inner_size)]
+        flat_out = [out_list[d][inner]
+                    for d in range(dim_size) for inner in range(inner_size)]
+        spec_out = spec_log_softmax_backward_spatial(
+            flat_grad, flat_out, dim_size, inner_size, dtype=torch.float32,
+        )
+        spec_t = torch.tensor(
+            spec_out, dtype=torch.float32
+        ).reshape(dim_size, inner_size)
+        self.assertEqual(spec_t, result.cpu(), atol=0, rtol=0)
 
 
 class TestLayerNormKernel(TestCase):
@@ -2567,11 +3660,11 @@ class TestLayerNormKernel(TestCase):
         )
         self.assertEqual(dx.shape, x.shape)
         row_idx = 0
-        dY = list(grad[row_idx].cpu().numpy())
-        X = list(x[row_idx].cpu().numpy())
+        dY = grad[row_idx].cpu().tolist()
+        X = x[row_idx].cpu().tolist()
         m = mean[row_idx].item()
         r = rstd[row_idx].item()
-        gamma = list(w.cpu().numpy())
+        gamma = w.cpu().tolist()
         spec_dx = spec_layer_norm_backward_dx(dY, X, m, r, gamma, block_size=256)
         # FMA gap: per-thread accumulation of dYg * (X-mean) * rstd has FMA
         # candidates that nvcc compiles but our Python loop doesn't capture.
@@ -2593,12 +3686,10 @@ class TestLayerNormKernel(TestCase):
             grad, x, [256], mean, rstd, w, b, [False, True, True]
         )
         self.assertEqual(dw.shape, w.shape)
-        dY_np = grad.cpu().numpy()
-        X_np = x.cpu().numpy()
-        dY_rows = [list(dY_np[m]) for m in range(dY_np.shape[0])]
-        X_rows = [list(X_np[m]) for m in range(X_np.shape[0])]
-        mean_list = list(mean.cpu().numpy())
-        rstd_list = list(rstd.cpu().numpy())
+        dY_rows = grad.cpu().tolist()
+        X_rows = x.cpu().tolist()
+        mean_list = mean.cpu().tolist()
+        rstd_list = rstd.cpu().tolist()
         spec_dg = spec_layer_norm_backward_dgamma(
             dY_rows, X_rows, mean_list, rstd_list, block_dim_y=32,
         )
@@ -2611,7 +3702,9 @@ class TestLayerNormKernel(TestCase):
         )
 
     def test_layer_norm_backward_dgamma_small_M(self):
-        # M=8 -> GammaBetaBackwardSimpleCUDAKernel, purely sequential per feature.
+        # M=8 < 64 → block_dim_y=1, rows_per_block_y=8, partial_reduction=true.
+        # Purely sequential: one thread per feature, loops over all M rows.
+        # FMA: acc = fma(dY*(X-mean), rstd, acc).
         M, N = 8, 5000
         x = torch.randn(M, N, device="cuda")
         w = torch.randn(N, device="cuda")
@@ -2623,22 +3716,32 @@ class TestLayerNormKernel(TestCase):
             grad, x, [N], mean, rstd, w, b, [False, True, True]
         )
         self.assertEqual(dw.shape, w.shape)
-        # Spec: bitwise — sequential loop per feature j:
-        #   dgamma[j] = sum_m dY[m,j] * (X[m,j] - mean[m]) * rstd[m]
-        dY_np = grad.cpu().numpy()
-        X_np = x.cpu().numpy()
-        mean_np = mean.cpu().numpy()
-        rstd_np = rstd.cpu().numpy()
-        for j in range(N):
-            acc = np.float32(0.0)
-            for m in range(M):
-                acc = acc + np.float32(
-                    np.float32(dY_np[m, j])
-                    * np.float32(np.float32(X_np[m, j]) - np.float32(mean_np[m]))
-                    * np.float32(rstd_np[m])
-                )
-            # FMA gap: dY*(X-mean)*rstd chain compiled by nvcc but not by Python
-            self.assertEqual(float(acc), dw[j].item(), atol=1e-6, rtol=0)
+        spec_dw = spec_gamma_beta_backward_dgamma_simple(
+            grad.cpu().tolist(), x.cpu().tolist(),
+            mean.cpu().tolist(), rstd.cpu().tolist(),
+        )
+        self.assertEqual(torch.tensor(spec_dw), dw.cpu(), atol=0, rtol=0)
+
+    def test_layer_norm_backward_dbeta(self):
+        # dbeta uses the GammaBetaBackwardCUDAKernelTemplate tree:
+        # per-thread sequential sum over contiguous row blocks, then
+        # SHFL_XOR butterfly high-to-low across block_dim_y threads.
+        # M=1000 >= 256 → block_dim_y=32, rows_per_block_y=256.
+        M, N = 1000, 256
+        x = torch.randn(M, N, device="cuda")
+        w = torch.randn(N, device="cuda")
+        b = torch.randn(N, device="cuda")
+        mean = x.mean(dim=-1)
+        rstd = (1.0 / x.std(dim=-1, unbiased=False)).to(x.dtype)
+        grad = torch.randn_like(x)
+        _, _, db = torch.ops.aten.native_layer_norm_backward(
+            grad, x, [N], mean, rstd, w, b, [False, False, True]
+        )
+        self.assertEqual(db.shape, b.shape)
+        spec_db = spec_layer_norm_backward_dbeta(
+            grad, block_dim_y=32, rows_per_block_y=256,
+        )
+        self.assertEqual(spec_db, db, atol=0, rtol=0)
 
     def test_rms_norm_forward(self):
         N = 512
@@ -2666,16 +3769,39 @@ class TestLayerNormKernel(TestCase):
         self.assertEqual(dw_cuda.shape, w.shape)
         # Spec: sequential + BlockReduceSum for dX
         row_idx = 0
-        dY = list(grad[row_idx].cpu().numpy())
-        X = list(x[row_idx].cpu().numpy())
+        dY = grad[row_idx].cpu().tolist()
+        X = x[row_idx].cpu().tolist()
         r = rstd_cuda[row_idx].item()
-        gamma = list(w.cpu().numpy())
+        gamma = w.cpu().tolist()
         spec_dx = spec_rms_norm_backward_dx(dY, X, r, gamma, block_size=256)
         # FMA gap: dY*gamma*X*rstd per-thread accumulation compiled by nvcc
         self.assertEqual(
             torch.tensor(spec_dx),
             dx_cuda[row_idx].cpu(),
             atol=1e-6, rtol=1e-5,
+        )
+
+    def test_rms_norm_backward_dgamma(self):
+        M, N = 1000, 256
+        x = torch.randn(M, N, device="cuda")
+        w = torch.randn(N, device="cuda")
+        result, rstd_cuda = torch._fused_rms_norm(x, [N], w, 1e-5)
+        grad = torch.randn_like(x)
+        _, dw_cuda = torch.ops.aten._fused_rms_norm_backward(
+            grad, x, [N], rstd_cuda, w, [False, True]
+        )
+        self.assertEqual(dw_cuda.shape, w.shape)
+        dY_rows = grad.cpu().tolist()
+        X_rows = x.cpu().tolist()
+        rstd_list = rstd_cuda.cpu().flatten().tolist()
+        spec_dg = spec_rms_norm_backward_dgamma(
+            dY_rows, X_rows, rstd_list, block_dim_y=32,
+        )
+        # FMA gap in per-thread dY*X*rstd accumulation + XOR butterfly
+        self.assertEqual(
+            torch.tensor(spec_dg),
+            dw_cuda.cpu(),
+            atol=1e-4, rtol=1e-3,
         )
 
 
@@ -2714,14 +3840,14 @@ class TestGroupNormKernel(TestCase):
         tw = []
         for tid in range(block_size):
             m, s2, c = _compiled_welford_ops_reduce(group_data, tid, block_size)
-            tw.append((np.float32(m.item()), np.float32(s2.item()), np.float32(c.item())))
-        wid = (np.float32(0), np.float32(0), np.float32(0))
+            tw.append((_f32(m.item()), _f32(s2.item()), _f32(c.item())))
+        wid = (_f32(0), _f32(0), _f32(0))
         def cw(a, b):
             if a[2] == 0: return b
             if b[2] == 0: return a
             ta = [torch.tensor(float(v), device="cuda") for v in list(a) + list(b)]
             m, s2, c = _compiled_welford_ops_combine(*ta)
-            return (np.float32(m.item()), np.float32(s2.item()), np.float32(c.item()))
+            return (_f32(m.item()), _f32(s2.item()), _f32(c.item()))
         wr = []
         for w_id in range(num_warps):
             wr.append(shfl_down_reduce_high_to_low(
@@ -2734,28 +3860,65 @@ class TestGroupNormKernel(TestCase):
             torch.tensor(float(s2s), device="cuda") / torch.tensor(float(cs), device="cuda")
             + torch.tensor(1e-5, device="cuda")
         ).item()
-        self.assertEqual(float(np.float32(ms)), mean_t[0, 0].item(), atol=0, rtol=0)
+        self.assertEqual(float(_f32(ms)), mean_t[0, 0].item(), atol=0, rtol=0)
         self.assertEqual(rstd_s, rstd_t[0, 0].item(), atol=0, rtol=0)
 
     def test_group_norm_backward(self):
+        # Group norm backward dw uses ComputeInternalGradientsCUDAKernel
+        # (WarpReduceSum tree) + GammaBetaBackwardCUDAKernel1 (sequential + FMA).
         x = torch.randn(8, 32, 16, 16, device="cuda")
         w = torch.randn(32, device="cuda")
         b = torch.randn(32, device="cuda")
-        y, mean, rstd = torch.ops.aten.native_group_norm(x, w, b, 8, 32, 256, 8, 1e-5)
+        N_batch, C, HxW, G = 8, 32, 256, 8
+        y, mean, rstd = torch.ops.aten.native_group_norm(
+            x, w, b, N_batch, C, HxW, G, 1e-5)
         grad = torch.randn_like(y)
         dx, dw, db = torch.ops.aten.native_group_norm_backward(
-            grad, x, mean, rstd, w, 8, 32, 256, 8, [True, True, True]
+            grad, x, mean, rstd, w, N_batch, C, HxW, G, [True, True, True]
         )
         self.assertEqual(dx.shape, x.shape)
-        # Same BlockReduceSum pattern as layer norm backward.
-        # Verify dw for channel 0 against CPU reference to avoid CUDA tree diffs.
-        ch = 0
-        group_idx = ch // 4  # 32 channels / 8 groups = 4 channels/group
-        ref_dw = 0.0
-        for bi in range(8):
-            ref_dw += float((grad[bi, ch].cpu() * (x[bi, ch].cpu() - mean[bi, group_idx].cpu()) * rstd[bi, group_idx].cpu()).sum().item())
-        # FMA gap in per-thread dY*(X-mean)*rstd accumulation
-        self.assertEqual(ref_dw, dw[ch].item(), atol=1e-5, rtol=0)
+        ds, db_int = spec_group_norm_backward_internal(
+            grad, x, N_batch, C, HxW, num_threads=32)
+        spec_dw, _ = spec_group_norm_backward_dw_db(
+            ds, db_int, mean, rstd, N_batch, C, G)
+        self.assertEqual(torch.tensor(spec_dw), dw.cpu(), atol=0, rtol=0)
+
+    def test_group_norm_backward_dx(self):
+        x = torch.randn(8, 32, 16, 16, device="cuda")
+        w = torch.randn(32, device="cuda")
+        b = torch.randn(32, device="cuda")
+        N_batch, C, HxW, G = 8, 32, 256, 8
+        y, mean, rstd = torch.ops.aten.native_group_norm(
+            x, w, b, N_batch, C, HxW, G, 1e-5)
+        grad = torch.randn_like(y)
+        dx, _, _ = torch.ops.aten.native_group_norm_backward(
+            grad, x, mean, rstd, w, N_batch, C, HxW, G, [True, False, False]
+        )
+        ds, db_int = spec_group_norm_backward_internal(
+            grad, x, N_batch, C, HxW, num_threads=32)
+        spec_dx = spec_group_norm_backward_dx(
+            grad, x, mean, rstd, w, ds, db_int, N_batch, C, HxW, G)
+        self.assertEqual(spec_dx, dx, atol=0, rtol=0)
+
+    def test_group_norm_backward_db(self):
+        # dbeta[c] = sum_n(db_internal[n,c]) where db_internal is from
+        # ComputeInternalGradientsCUDAKernel (WarpReduceSum tree).
+        x = torch.randn(8, 32, 16, 16, device="cuda")
+        w = torch.randn(32, device="cuda")
+        b = torch.randn(32, device="cuda")
+        N_batch, C, HxW, G = 8, 32, 256, 8
+        y, mean, rstd = torch.ops.aten.native_group_norm(
+            x, w, b, N_batch, C, HxW, G, 1e-5)
+        grad = torch.randn_like(y)
+        _, _, db = torch.ops.aten.native_group_norm_backward(
+            grad, x, mean, rstd, w, N_batch, C, HxW, G, [False, False, True]
+        )
+        self.assertEqual(db.shape, b.shape)
+        ds, db_int = spec_group_norm_backward_internal(
+            grad, x, N_batch, C, HxW, num_threads=32)
+        _, spec_db = spec_group_norm_backward_dw_db(
+            ds, db_int, mean, rstd, N_batch, C, G)
+        self.assertEqual(torch.tensor(spec_db), db.cpu(), atol=0, rtol=0)
 
 
 class TestNormalization(TestCase):
@@ -2830,17 +3993,17 @@ class TestNormalization(TestCase):
             for tx in range(block_x):
                 m, s2, c = _compiled_nchw_welford_reduce(
                     x3d, ch, ty, block_y, tx, block_x)
-                tw.append((np.float32(m.item()), np.float32(s2.item()),
-                           np.float32(c.item())))
+                tw.append((_f32(m.item()), _f32(s2.item()),
+                           _f32(c.item())))
         def cw(a, b):
             if a[2] == 0: return b
             if b[2] == 0: return a
             ta = [torch.tensor(float(v), device="cuda")
                   for v in [a[0], a[1], a[2], b[0], b[1], b[2]]]
             m, s2, c = _compiled_nchw_welford_merge(*ta)
-            return (np.float32(m.item()), np.float32(s2.item()),
-                    np.float32(c.item()))
-        wid = (np.float32(0), np.float32(0), np.float32(0))
+            return (_f32(m.item()), _f32(s2.item()),
+                    _f32(c.item()))
+        wid = (_f32(0), _f32(0), _f32(0))
         warp_size = 32
         num_warps = (block_x * block_y) // warp_size
         wr = []
@@ -2852,9 +4015,9 @@ class TestNormalization(TestCase):
         final = shfl_xor_butterfly_low_to_high(wr[:warp_size], cw)
         ms, s2s, cs = final
         invstd_s = torch.rsqrt(torch.tensor(
-            float(np.float32(s2s) / np.float32(cs) + np.float32(1e-5)),
+            float(_f32(s2s) / _f32(cs) + _f32(1e-5)),
             device="cuda", dtype=torch.float32)).item()
-        self.assertEqual(float(np.float32(ms)), mean_cuda[ch].item(), atol=0, rtol=0)
+        self.assertEqual(float(_f32(ms)), mean_cuda[ch].item(), atol=0, rtol=0)
         # bitwise — fixed association: var_n + (o_var_n + cross) not (var_n + o_var_n) + cross
         self.assertEqual(invstd_s, invstd_cuda[ch].item(), atol=0, rtol=0)
 
@@ -2904,14 +4067,14 @@ class TestNormalization(TestCase):
                 s2n = torch.tensor(accs[j][1], device="cuda")
                 cn = torch.tensor(float(accs[j][2]), device="cuda")
                 mr, s2r, cr = _compiled_nhwc_welford_merge(mr, s2r, cr, mn, s2n, cn)
-            tw.append((np.float32(mr.item()), np.float32(s2r.item()), np.float32(cr.item())))
+            tw.append((_f32(mr.item()), _f32(s2r.item()), _f32(cr.item())))
         # welford_merge_block_vertical
         def merge_w(a, b):
             if a[2] == 0: return b
             if b[2] == 0: return a
             ta = [torch.tensor(float(v), device="cuda") for v in [a[0],a[1],a[2],b[0],b[1],b[2]]]
             m, s2, c = _compiled_nhwc_welford_merge(*ta)
-            return (np.float32(m.item()), np.float32(s2.item()), np.float32(c.item()))
+            return (_f32(m.item()), _f32(s2.item()), _f32(c.item()))
         wrs = list(tw)
         off = len(wrs) // 2
         while off > 0:
@@ -2920,9 +4083,9 @@ class TestNormalization(TestCase):
             off //= 2
         ms, s2s, cs = wrs[0]
         invstd_s = torch.rsqrt(torch.tensor(
-            float(np.float32(s2s)/np.float32(cs) + np.float32(1e-5)),
+            float(_f32(s2s)/_f32(cs) + _f32(1e-5)),
             device="cuda", dtype=torch.float32)).item()
-        self.assertEqual(float(np.float32(ms)), mean_cuda[ch].item(), atol=0, rtol=0)
+        self.assertEqual(float(_f32(ms)), mean_cuda[ch].item(), atol=0, rtol=0)
         self.assertEqual(invstd_s, invstd_cuda[ch].item(), atol=0, rtol=0)
 
     def test_batch_norm_nchw_backward(self):
@@ -2937,47 +4100,142 @@ class TestNormalization(TestCase):
             grad, x, w, rm, rv, sm, si, True, 1e-5, [True, True, True]
         )
         self.assertEqual(dx.shape, x.shape)
-        # Float2 XOR butterfly for NCHW backward. db = sum_dy from the kernel.
+        # Fused kernel (grad_input_mask[0]=True): block_x=getNumThreads(64)=64,
+        # block_y=max(1,512/64)=8. B=32, S=64.
         ch = 0
-        grad_ch = list(grad[:, ch, :, :].contiguous().view(-1).cpu().numpy())
-        input_ch = list(x[:, ch, :, :].contiguous().view(-1).cpu().numpy())
+        grad_ch = grad[:, ch, :, :].contiguous().view(-1).cpu().tolist()
+        input_ch = x[:, ch, :, :].contiguous().view(-1).cpu().tolist()
         mean_ch = sm[ch].item()
         spec_sum_dy, spec_sum_dy_xmu = spec_batch_norm_nchw_backward_reduce(
-            grad_ch, input_ch, mean_ch, block_size=512,
+            grad_ch, input_ch, mean_ch,
+            block_x=64, block_y=8, B=32, S=64,
         )
-        # db[ch] IS sum_dy from the kernel, not from a separate gpu_reduce_kernel.
-        # FMA gap: the per-thread Float2 accumulation dy_xmu = dy*(x-mean) has
-        # FMA opportunity that our Python loop doesn't capture.
         self.assertEqual(
             torch.tensor(spec_sum_dy),
             torch.tensor(db[ch].item()),
-            atol=1e-6, rtol=1e-5,
+            atol=0, rtol=0,
         )
 
     def test_batch_norm_nhwc_backward(self):
-        x = torch.randn(32, 64, 8, 8, device="cuda").to(
+        # Small tensor to ensure grid.y=1 in NHWC backward reduce.
+        x = torch.randn(8, 64, 4, 4, device="cuda").to(
             memory_format=torch.channels_last
         )
         w = torch.ones(64, device="cuda")
         rm = torch.zeros(64, device="cuda")
         rv = torch.ones(64, device="cuda")
-        sm = x.to(memory_format=torch.contiguous_format).mean(dim=(0, 2, 3))
-        si = 1.0 / x.to(memory_format=torch.contiguous_format).std(
-            dim=(0, 2, 3), unbiased=False
-        )
+        x_contig = x.to(memory_format=torch.contiguous_format)
+        sm = x_contig.mean(dim=(0, 2, 3))
+        si = 1.0 / x_contig.std(dim=(0, 2, 3), unbiased=False)
         grad = torch.randn_like(x)
         dx, dw, db = torch.ops.aten.native_batch_norm_backward(
             grad, x, w, rm, rv, sm, si, True, 1e-5, [True, True, True]
         )
         self.assertEqual(dx.shape, x.shape)
-        # db = sum_dy from the NHWC backward kernel. Compare against CPU sum
-        # to avoid comparing two different CUDA reduction trees.
+        _, _, spec_db = spec_batch_norm_nhwc_backward(
+            grad, x, sm, si, w)
+        self.assertEqual(spec_db, db, atol=0, rtol=0)
+
+    def test_batch_norm_nchw_backward_dx(self):
+        x = torch.randn(32, 64, 8, 8, device="cuda")
+        w = torch.ones(64, device="cuda")
+        rm = torch.zeros(64, device="cuda")
+        rv = torch.ones(64, device="cuda")
+        sm = x.mean(dim=(0, 2, 3))
+        si = 1.0 / x.std(dim=(0, 2, 3), unbiased=False)
+        grad = torch.randn_like(x)
+        dx, _, _ = torch.ops.aten.native_batch_norm_backward(
+            grad, x, w, rm, rv, sm, si, True, 1e-5, [True, False, False]
+        )
+        self.assertEqual(dx.shape, x.shape)
+        spec_dx, _, _ = spec_batch_norm_nchw_backward(
+            grad, x, sm, si, w)
+        self.assertEqual(spec_dx, dx, atol=0, rtol=0)
+
+    def test_batch_norm_nhwc_backward_dw(self):
+        x = torch.randn(8, 64, 4, 4, device="cuda").to(
+            memory_format=torch.channels_last
+        )
+        w = torch.ones(64, device="cuda")
+        rm = torch.zeros(64, device="cuda")
+        rv = torch.ones(64, device="cuda")
+        x_contig = x.to(memory_format=torch.contiguous_format)
+        sm = x_contig.mean(dim=(0, 2, 3))
+        si = 1.0 / x_contig.std(dim=(0, 2, 3), unbiased=False)
+        grad = torch.randn_like(x)
+        _, dw, _ = torch.ops.aten.native_batch_norm_backward(
+            grad, x, w, rm, rv, sm, si, True, 1e-5, [False, True, False]
+        )
+        self.assertEqual(dw.shape, w.shape)
+        _, spec_dw, _ = spec_batch_norm_nhwc_backward(
+            grad, x, sm, si, w)
+        self.assertEqual(spec_dw, dw, atol=0, rtol=0)
+
+    def test_batch_norm_nhwc_backward_reduce_spec(self):
+        # Small tensor so grid.y=1 (no multi-CTA staging).
+        x = torch.randn(8, 4, 4, 4, device="cuda").to(
+            memory_format=torch.channels_last
+        )
+        w = torch.ones(4, device="cuda")
+        rm = torch.zeros(4, device="cuda")
+        rv = torch.ones(4, device="cuda")
+        sm = x.to(memory_format=torch.contiguous_format).mean(dim=(0, 2, 3))
+        si = 1.0 / x.to(memory_format=torch.contiguous_format).std(
+            dim=(0, 2, 3), unbiased=False
+        )
+        grad = torch.randn_like(x)
+        _, _, db = torch.ops.aten.native_batch_norm_backward(
+            grad, x, w, rm, rv, sm, si, True, 1e-5, [False, False, True]
+        )
         ch = 0
-        grad_ch_cpu = grad.to(memory_format=torch.contiguous_format)[:, ch, :, :].cpu()
-        ref_sum_dy = float(grad_ch_cpu.sum().item())
-        # Float2 shmem halving combine is component-wise addition (no FMA gap
-        # for sum_dy itself). The gap is only in sum_dy_xmu = dy*(x-mean).
-        self.assertEqual(ref_sum_dy, db[ch].item(), atol=1e-5, rtol=0)
+        grad_ch = grad.to(
+            memory_format=torch.contiguous_format
+        )[:, ch, :, :].contiguous().view(-1)
+        input_ch = x.to(
+            memory_format=torch.contiguous_format
+        )[:, ch, :, :].contiguous().view(-1)
+        mean_ch = sm[ch].item()
+        grad_list = grad_ch.cpu().tolist()
+        input_list = input_ch.cpu().tolist()
+        spec_sum_dy, _ = spec_batch_norm_nhwc_backward_reduce(
+            grad_list, input_list, mean_ch, block_y=8,
+        )
+        self.assertEqual(spec_sum_dy, db[ch].item(), atol=0, rtol=0)
+
+    def test_batch_norm_nchw_backward_dw(self):
+        x = torch.randn(32, 64, 8, 8, device="cuda")
+        w = torch.ones(64, device="cuda")
+        rm = torch.zeros(64, device="cuda")
+        rv = torch.ones(64, device="cuda")
+        sm = x.mean(dim=(0, 2, 3))
+        si = 1.0 / x.std(dim=(0, 2, 3), unbiased=False)
+        grad = torch.randn_like(x)
+        _, dw, _ = torch.ops.aten.native_batch_norm_backward(
+            grad, x, w, rm, rv, sm, si, True, 1e-5, [False, True, False]
+        )
+        self.assertEqual(dw.shape, w.shape)
+        _, spec_dw, _ = spec_batch_norm_nchw_backward(
+            grad, x, sm, si, w, fused=False)
+        self.assertEqual(spec_dw, dw, atol=0, rtol=0)
+
+    def test_batch_norm_nhwc_backward_dx(self):
+        x = torch.randn(8, 64, 4, 4, device="cuda").to(
+            memory_format=torch.channels_last
+        )
+        w = torch.ones(64, device="cuda")
+        rm = torch.zeros(64, device="cuda")
+        rv = torch.ones(64, device="cuda")
+        x_contig = x.to(memory_format=torch.contiguous_format)
+        sm = x_contig.mean(dim=(0, 2, 3))
+        si = 1.0 / x_contig.std(dim=(0, 2, 3), unbiased=False)
+        grad = torch.randn_like(x)
+        dx, _, _ = torch.ops.aten.native_batch_norm_backward(
+            grad, x, w, rm, rv, sm, si, True, 1e-5, [True, False, False]
+        )
+        self.assertEqual(dx.shape, x.shape)
+        spec_dx, _, _ = spec_batch_norm_nhwc_backward(
+            grad, x, sm, si, w)
+        self.assertEqual(spec_dx, dx, atol=0, rtol=0)
 
 
 class TestLoss(TestCase):
@@ -3006,19 +4264,34 @@ class TestLoss(TestCase):
         # Block size from nll_loss_threads: clamp(1<<round(log2(nframe/16)), 32, 1024)
         nframe = x.shape[0]
         nthreads = max(32, min(1024, 1 << round(math.log2(nframe / 16))))
-        losses = list(-x[torch.arange(nframe, device="cuda"), target].cpu().numpy())
+        losses = (-x[torch.arange(nframe, device="cuda"), target]).cpu().tolist()
         spec_val = spec_nll_loss_reduce(losses, block_size=nthreads)
         self.assertEqual(spec_val, result.item(), atol=0, rtol=0)
 
     def test_cross_entropy(self):
         # cross_entropy = log_softmax + nll_loss
-        # Compare CUDA result against CPU (same composite op, deterministic).
         x = torch.randn(1000, 100, device="cuda")
         target = torch.randint(0, 100, (1000,), device="cuda")
         result = torch.nn.functional.cross_entropy(x, target)
         self.assertEqual(result.shape, ())
-        ref = torch.nn.functional.cross_entropy(x.cpu(), target.cpu())
-        self.assertEqual(ref.item(), result.item(), atol=1e-5, rtol=0)
+        ref = ref_cross_entropy_forward(x, target)
+        self.assertEqual(ref, result.item(), atol=0, rtol=0)
+
+    def test_nll_loss_backward(self):
+        x = torch.randn(1000, 100, device="cuda", requires_grad=True)
+        target = torch.randint(0, 100, (1000,), device="cuda")
+        loss = torch.nn.functional.nll_loss(x, target, reduction="mean")
+        loss.backward()
+        ref = ref_nll_loss_backward(1000, 100, target)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
+
+    def test_cross_entropy_backward(self):
+        x = torch.randn(1000, 100, device="cuda", requires_grad=True)
+        target = torch.randint(0, 100, (1000,), device="cuda")
+        loss = torch.nn.functional.cross_entropy(x, target)
+        loss.backward()
+        ref = ref_cross_entropy_backward(x, target)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
 
 
 class TestNLLLoss2d(TestCase):
@@ -3033,22 +4306,36 @@ class TestNLLLoss2d(TestCase):
         target = torch.randint(0, 10, (8, 32, 32), device="cuda")
         result = torch.nn.functional.nll_loss(x, target, reduction="mean")
         self.assertEqual(result.shape, ())
-        # Compare against sum reduction computed via spec_nll_loss_reduce.
-        # NLLLoss2d uses the same shmem halving tree as Loss.cu.
+        # NLLLoss2d (NLLLoss2d.cu) uses per-sample blocks with BlockReduceSum,
+        # then gpuAtomicAdd across blocks. CUDA_NUM_THREADS=1024.
         result_sum = torch.nn.functional.nll_loss(x, target, reduction="sum")
-        nframe = x.shape[0] * x.shape[2] * x.shape[3]
-        losses = []
-        x_np = x.cpu().numpy()
-        t_np = target.cpu().numpy()
+        x_list = x.cpu().tolist()
+        t_list = target.cpu().tolist()
+        NTHREADS = 1024
+        map_nelem = 32 * 32
+        per_sample_sums = []
         for bi in range(8):
-            for h in range(32):
-                for w in range(32):
-                    losses.append(np.float32(-x_np[bi, t_np[bi, h, w], h, w]))
-        # NLLLoss2d uses a different kernel with different tree than 1D NLL loss.
-        # Block size varies. Compare spec sum against CUDA sum.
-        nthreads = max(32, min(1024, 1 << round(math.log2(nframe / 16))))
-        spec_val = spec_nll_loss_reduce(losses, block_size=nthreads)
-        self.assertEqual(float(spec_val), result_sum.item(), atol=1e-2, rtol=0)
+            thread_vals = [_f32(0.0)] * NTHREADS
+            for tid in range(map_nelem):
+                h, w = tid // 32, tid % 32
+                thread_vals[tid] = _f32(-x_list[bi][t_list[bi][h][w]][h][w])
+            total = block_reduce_cuh(
+                thread_vals, lambda a, b: _f32(a + b), _f32(0.0))
+            per_sample_sums.append(_f32(total))
+        spec_val = _f32(0.0)
+        for s in per_sample_sums:
+            spec_val = _f32(spec_val + s)
+        # gpuAtomicAdd across blocks is non-deterministic (order depends on
+        # GPU scheduling), so tolerance covers ≈1 ULP at sum magnitude.
+        self.assertEqual(float(spec_val), result_sum.item(), atol=4e-3, rtol=0)
+
+    def test_nll_loss_2d_backward(self):
+        x = torch.randn(8, 10, 32, 32, device="cuda", requires_grad=True)
+        target = torch.randint(0, 10, (8, 32, 32), device="cuda")
+        loss = torch.nn.functional.nll_loss(x, target, reduction="mean")
+        loss.backward()
+        ref = ref_nll_loss_2d_backward(x.shape, target)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
 
 
 class TestMultiMarginLoss(TestCase):
@@ -3075,20 +4362,29 @@ class TestMultiMarginLoss(TestCase):
         target = torch.randint(0, 50, (1,), device="cuda")
         result = torch.nn.functional.multi_margin_loss(x, target)
         self.assertEqual(result.shape, ())
-        x_np = x.cpu().numpy()
+        x_list = x.cpu().tolist()
         tgt = target[0].item()
         THREADS = 128
-        per_thread = [np.float32(0.0)] * THREADS
+        per_thread = [_f32(0.0)] * THREADS
         for tid in range(THREADS):
             for c in range(tid, 50, THREADS):
                 if c == tgt:
                     continue
-                per_thread[tid] = per_thread[tid] + np.float32(
-                    max(0, 1.0 - x_np[0, tgt] + x_np[0, c]))
+                per_thread[tid] = _f32(per_thread[tid] + _f32(
+                    max(0, _f32(_f32(1.0 - x_list[0][tgt]) + x_list[0][c]))))
         sample_loss = spec_multi_margin_loss_thread0_scan(per_thread)
-        # Kernel divides by nclass. For mean reduction with nframe=1, this is the result.
-        ref = float(sample_loss) / 50.0
-        self.assertEqual(ref, result.item(), atol=1e-6, rtol=0)
+        # Kernel divides by nclass in float32: static_cast<scalar_t>(sum / denom)
+        ref = _f32(float(sample_loss) / 50.0)
+        self.assertEqual(ref, result.item(), atol=0, rtol=0)
+
+    def test_multi_margin_loss_backward(self):
+        x = torch.randn(1, 50, device="cuda", requires_grad=True)
+        target = torch.randint(0, 50, (1,), device="cuda")
+        loss = torch.nn.functional.multi_margin_loss(x, target)
+        loss.backward()
+        ref = ref_multi_margin_loss_backward(
+            x.detach(), target)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
 
 
 class TestMultiLabelMarginCriterion(TestCase):
@@ -3106,8 +4402,6 @@ class TestMultiLabelMarginCriterion(TestCase):
     """
 
     def test_multilabel_margin_loss(self):
-        # Same shmem_halving_reduce tree as spec_nll_loss_reduce.
-        # Compare CUDA against CPU (same algorithm, deterministic on CPU).
         x = torch.randn(100, 50, device="cuda")
         target = torch.zeros(100, 50, dtype=torch.long, device="cuda") - 1
         for i in range(100):
@@ -3115,8 +4409,25 @@ class TestMultiLabelMarginCriterion(TestCase):
             target[i, :n] = torch.randint(0, 50, (n,))
         result = torch.nn.functional.multilabel_margin_loss(x, target)
         self.assertEqual(result.shape, ())
-        ref = torch.nn.functional.multilabel_margin_loss(x.cpu(), target.cpu())
-        self.assertEqual(ref.item(), result.item(), atol=1e-5, rtol=0)
+        ref = ref_multilabel_margin_loss_forward(
+            x, target)
+        self.assertEqual(ref, result.item(), atol=0, rtol=0)
+
+    def test_multilabel_margin_loss_backward(self):
+        x = torch.randn(100, 50, device="cuda", requires_grad=True)
+        target = torch.zeros(100, 50, dtype=torch.long, device="cuda") - 1
+        for i in range(100):
+            n = torch.randint(1, 10, (1,)).item()
+            target[i, :n] = torch.randint(0, 50, (n,))
+        loss = torch.nn.functional.multilabel_margin_loss(x, target)
+        loss.backward()
+        ref = ref_multilabel_margin_loss_backward(
+            x.detach(), target)
+        # Kernel race: thread 0 writes last target's BlockReduceSum to
+        # grad_input without __syncthreads before the final grad_output
+        # multiply loop, so threads in other warps may read stale values.
+        # Max per-element error: (C - n_targets) * g ≈ 0.0098.
+        self.assertEqual(ref, x.grad, atol=1e-2, rtol=0)
 
 
 class TestLossCTC(TestCase):
@@ -3135,7 +4446,6 @@ class TestLossCTC(TestCase):
     """
 
     def test_ctc_loss(self):
-        # Spec: sequential DP, not a parallel reduction tree; not separately tested
         T, N, C = 50, 8, 30
         log_probs = torch.randn(T, N, C, device="cuda").log_softmax(dim=2)
         targets = torch.randint(1, C, (N, 20), device="cuda")
@@ -3145,13 +4455,27 @@ class TestLossCTC(TestCase):
             log_probs, targets, input_lengths, target_lengths, blank=0
         )
         self.assertEqual(result.shape, ())
-        # CPU vs CUDA: same DP but different exp/log implementations.
-        # logaddexp = log1p(exp(min-max)) + max uses CUDA transcendentals.
-        ref = torch.nn.functional.ctc_loss(
-            log_probs.cpu(), targets.cpu(), input_lengths.cpu(),
-            target_lengths.cpu(), blank=0
+        ref_loss, _ = ref_ctc_loss_forward_backward(
+            log_probs, targets, input_lengths, target_lengths, blank=0
         )
-        self.assertEqual(ref.item(), result.item(), atol=1e-5, rtol=0)
+        self.assertEqual(ref_loss, result.item(), atol=0, rtol=0)
+
+    def test_ctc_loss_backward(self):
+        T, N, C = 50, 8, 30
+        log_probs = torch.randn(T, N, C, device="cuda").log_softmax(
+            dim=2
+        ).requires_grad_(True)
+        targets = torch.randint(1, C, (N, 20), device="cuda")
+        input_lengths = torch.full((N,), T, dtype=torch.long, device="cuda")
+        target_lengths = torch.full((N,), 20, dtype=torch.long, device="cuda")
+        loss = torch.nn.functional.ctc_loss(
+            log_probs, targets, input_lengths, target_lengths, blank=0
+        )
+        loss.backward()
+        _, ref_grad = ref_ctc_loss_forward_backward(
+            log_probs, targets, input_lengths, target_lengths, blank=0
+        )
+        self.assertEqual(ref_grad, log_probs.grad, atol=0, rtol=0)
 
 
 class TestCumsumKernel(TestCase):
@@ -3201,10 +4525,10 @@ class TestCumsumKernel(TestCase):
         log_ntx = min(max(4, (9 + log_x - log_y) // 2), 9)
         ntx = 1 << log_ntx
         for i in range(min(4, x.shape[0])):
-            row = list(x[i].cpu().numpy())
+            row = x[i].cpu().tolist()
             spec_out = spec_cumsum_innermost_sklansky(row, num_threads_x=ntx)
             self.assertEqual(
-                torch.tensor(np.array(spec_out, dtype=np.float32)),
+                torch.tensor(spec_out, dtype=torch.float32),
                 result[i].cpu(),
                 atol=0, rtol=0,
             )
@@ -3214,12 +4538,58 @@ class TestCumsumKernel(TestCase):
         result = torch.cumsum(x, dim=0)
         self.assertEqual(result.shape, x.shape)
         # Spec: bitwise match (purely sequential outer-dim scan)
-        x_np = x.cpu().numpy()
-        flat = list(x_np.flatten())
+        flat = x.cpu().flatten().tolist()
         spec_out = spec_cumsum_outer_sequential(flat, x.shape[0], x.shape[1])
         for c in range(min(4, x.shape[1])):
             for r in range(x.shape[0]):
                 self.assertEqual(spec_out[r * x.shape[1] + c], result[r, c].item(), atol=0, rtol=0)
+
+    def test_cumsum_backward_innermost(self):
+        # cumsum backward = flip(cumsum(flip(grad))). Same Sklansky tree.
+        x = torch.randn(100, 5000, device="cuda", requires_grad=True)
+        result = torch.cumsum(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        num_rows, row_size = x.shape
+        log_x = 0
+        while (1 << log_x) < row_size:
+            log_x += 1
+        log_y = 0
+        while (1 << log_y) < num_rows:
+            log_y += 1
+        log_ntx = min(max(4, (9 + log_x - log_y) // 2), 9)
+        ntx = 1 << log_ntx
+        for i in range(min(4, x.shape[0])):
+            grad_row = grad[i].flip(0).cpu().tolist()
+            spec_out = spec_cumsum_innermost_sklansky(grad_row,
+                                                      num_threads_x=ntx)
+            spec_flipped = list(reversed(spec_out))
+            self.assertEqual(
+                torch.tensor(spec_flipped, dtype=torch.float32),
+                x.grad[i].cpu(),
+                atol=0, rtol=0,
+            )
+
+    def test_cumsum_backward_outer(self):
+        # cumsum backward along dim=0 = flip(cumsum(flip(grad, 0), 0), 0)
+        x = torch.randn(5000, 100, device="cuda", requires_grad=True)
+        result = torch.cumsum(x, dim=0)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        grad_flipped = grad.flip(0).cpu()
+        flat = grad_flipped.flatten().tolist()
+        spec_out = spec_cumsum_outer_sequential(flat, x.shape[0], x.shape[1])
+        spec_t = torch.tensor(spec_out, dtype=torch.float32).reshape(
+            x.shape[0], x.shape[1]
+        )
+        spec_flipped = spec_t.flip(0)
+        for c in range(min(4, x.shape[1])):
+            for r in range(x.shape[0]):
+                self.assertEqual(
+                    spec_flipped[r, c].item(),
+                    x.grad[r, c].item(),
+                    atol=0, rtol=0,
+                )
 
 
 class TestCumprodKernel(TestCase):
@@ -3243,10 +4613,10 @@ class TestCumprodKernel(TestCase):
         log_ntx = min(max(4, (9 + log_x - log_y) // 2), 9)
         ntx = 1 << log_ntx
         for i in range(min(4, x.shape[0])):
-            row = list(x[i].cpu().numpy())
+            row = x[i].cpu().tolist()
             spec_out = spec_cumprod_innermost_sklansky(row, num_threads_x=ntx)
             self.assertEqual(
-                torch.tensor(np.array(spec_out, dtype=np.float32)),
+                torch.tensor(spec_out, dtype=torch.float32),
                 result[i].cpu(),
                 atol=0, rtol=0,
             )
@@ -3255,12 +4625,27 @@ class TestCumprodKernel(TestCase):
         x = torch.randn(5000, 100, device="cuda")
         result = torch.cumprod(x, dim=0)
         self.assertEqual(result.shape, x.shape)
-        x_np = x.cpu().numpy()
-        flat = list(x_np.flatten())
+        flat = x.cpu().flatten().tolist()
         spec_out = spec_cumprod_outer_sequential(flat, x.shape[0], x.shape[1])
         for c in range(min(4, x.shape[1])):
             for r in range(x.shape[0]):
                 self.assertEqual(spec_out[r * x.shape[1] + c], result[r, c].item(), atol=0, rtol=0)
+
+    def test_cumprod_backward_innermost(self):
+        x = torch.randn(10, 100, device="cuda", requires_grad=True)
+        result = torch.cumprod(x, dim=-1)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_cumprod_backward(grad, x, dim=-1)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
+
+    def test_cumprod_backward_outer(self):
+        x = torch.randn(100, 10, device="cuda", requires_grad=True)
+        result = torch.cumprod(x, dim=0)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_cumprod_backward(grad, x, dim=0)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
 
 
 class TestLogcumsumexpKernel(TestCase):
@@ -3285,10 +4670,10 @@ class TestLogcumsumexpKernel(TestCase):
         log_ntx = min(max(4, (9 + log_x - log_y) // 2), 9)
         ntx = 1 << log_ntx
         for i in range(min(4, x.shape[0])):
-            row = list(x[i].cpu().numpy())
+            row = x[i].cpu().tolist()
             spec_out = spec_logcumsumexp_innermost_sklansky(row, num_threads_x=ntx)
             self.assertEqual(
-                torch.tensor(np.array(spec_out, dtype=np.float32)),
+                torch.tensor(spec_out, dtype=torch.float32),
                 result[i].cpu(),
                 atol=0, rtol=0,
             )
@@ -3297,12 +4682,29 @@ class TestLogcumsumexpKernel(TestCase):
         x = torch.randn(5000, 100, device="cuda")
         result = torch.logcumsumexp(x, dim=0)
         self.assertEqual(result.shape, x.shape)
-        x_np = x.cpu().numpy()
-        flat = [float(v) for v in x_np.flatten()]
+        flat = x.cpu().flatten().tolist()
         spec_out = spec_logcumsumexp_outer_sequential(flat, x.shape[0], x.shape[1])
         for c in range(min(4, x.shape[1])):
             for r in range(x.shape[0]):
                 self.assertEqual(spec_out[r * x.shape[1] + c], result[r, c].item(), atol=0, rtol=0)
+
+    def test_logcumsumexp_backward_innermost(self):
+        x = torch.randn(10, 100, device="cuda", requires_grad=True)
+        output = torch.logcumsumexp(x, dim=-1)
+        grad = torch.randn_like(output)
+        output.backward(grad)
+        ref = ref_logcumsumexp_backward(
+            grad, x.detach(), output.detach(), dim=-1)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
+
+    def test_logcumsumexp_backward_outer(self):
+        x = torch.randn(100, 10, device="cuda", requires_grad=True)
+        output = torch.logcumsumexp(x, dim=0)
+        grad = torch.randn_like(output)
+        output.backward(grad)
+        ref = ref_logcumsumexp_backward(
+            grad, x.detach(), output.detach(), dim=0)
+        self.assertEqual(ref, x.grad, atol=0, rtol=0)
 
 
 class TestScatterGatherKernel(TestCase):
@@ -3332,7 +4734,7 @@ class TestScatterGatherKernel(TestCase):
         idx2 = torch.arange(10, device="cuda")
         src2 = torch.randn(10, device="cuda")
         result2 = x2.scatter_add(0, idx2, src2)
-        spec_out = spec_scatter_add(10, list(range(10)), list(src2.cpu().numpy()))
+        spec_out = spec_scatter_add(10, list(range(10)), src2.cpu().tolist())
         for r in range(10):
             self.assertEqual(spec_out[r], result2[r].item(), atol=0, rtol=0)
 
@@ -3366,6 +4768,17 @@ class TestScatterGatherKernel(TestCase):
         # include_self=True by default, so mean = (0 + src) / 2 = src / 2
         self.assertEqual(src / 2, result, atol=0, rtol=0)
 
+    def test_scatter_add_backward(self):
+        # scatter_add backward w.r.t. src is gather: grad_src[i] = grad_out[idx[i]]
+        x = torch.zeros(100, 64, device="cuda")
+        idx = torch.randint(0, 100, (500, 64), device="cuda")
+        src = torch.randn(500, 64, device="cuda", requires_grad=True)
+        result = x.scatter_add(0, idx, src)
+        grad = torch.randn_like(result)
+        result.backward(grad)
+        ref = ref_scatter_add_backward(grad, idx)
+        self.assertEqual(ref, src.grad, atol=0, rtol=0)
+
 
 class TestSegmentReduce(TestCase):
     """SegmentReduce.cu
@@ -3386,22 +4799,21 @@ class TestSegmentReduce(TestCase):
     """
 
     def test_segment_reduce_1d(self):
-        # 1D uses CUB whose internal tree is opaque. Compare against CPU.
         x = torch.randn(10000, device="cuda")
         lengths = torch.tensor([100] * 100, device="cuda")
         result = torch.segment_reduce(x, "sum", lengths=lengths)
         self.assertEqual(result.shape, (100,))
-        ref = torch.segment_reduce(x.cpu(), "sum", lengths=lengths.cpu())
-        self.assertEqual(ref[0].item(), result[0].item(), atol=1e-5, rtol=0)
+        ref = ref_segment_reduce_sum_1d(x, lengths)
+        # CUB tree reduction — opaque internal ordering
+        self.assertEqual(ref, result, atol=1e-5, rtol=0)
 
     def test_segment_reduce_2d(self):
-        # Multi-dim: trivially sequential per (segment, feature). Should match CPU.
         x = torch.randn(10000, 64, device="cuda")
         lengths = torch.tensor([100] * 100, device="cuda")
         result = torch.segment_reduce(x, "sum", lengths=lengths)
         self.assertEqual(result.shape, (100, 64))
-        ref = torch.segment_reduce(x.cpu(), "sum", lengths=lengths.cpu())
-        self.assertEqual(ref[0, 0].item(), result[0, 0].item(), atol=1e-5, rtol=0)
+        ref = ref_segment_reduce_sum_2d(x, lengths)
+        self.assertEqual(ref, result, atol=0, rtol=0)
 
 
 class TestEmbeddingBag(TestCase):
@@ -3437,9 +4849,9 @@ class TestEmbeddingBag(TestCase):
         feat = 0
         bag_start = offsets[bag_idx].item()
         bag_end = offsets[bag_idx + 1].item() if bag_idx + 1 < len(offsets) else len(idx)
-        w_np = w.cpu().numpy()
-        idx_np = idx.cpu().numpy()
-        embeddings = [w_np[idx_np[j], feat] for j in range(bag_start, bag_end)]
+        w_list = w.cpu().tolist()
+        idx_list = idx.cpu().tolist()
+        embeddings = [w_list[idx_list[j]][feat] for j in range(bag_start, bag_end)]
         spec_val = spec_embedding_bag_sum(embeddings)
         self.assertEqual(spec_val, result[bag_idx, feat].item(), atol=0, rtol=0)
 
@@ -3456,11 +4868,11 @@ class TestEmbeddingBag(TestCase):
         bag_start = offsets[bag_idx].item()
         bag_end = offsets[bag_idx + 1].item()
         bag_size = bag_end - bag_start
-        w_np = w.cpu().numpy()
-        idx_np = idx.cpu().numpy()
-        embeddings = [w_np[idx_np[j], feat] for j in range(bag_start, bag_end)]
+        w_list = w.cpu().tolist()
+        idx_list = idx.cpu().tolist()
+        embeddings = [w_list[idx_list[j]][feat] for j in range(bag_start, bag_end)]
         spec_sum = spec_embedding_bag_sum(embeddings)
-        ref = spec_sum * np.float32(1.0 / bag_size)
+        ref = _f32(spec_sum * _f32(1.0 / bag_size))
         self.assertEqual(ref, result[bag_idx, feat].item(), atol=0, rtol=0)
 
     def test_embedding_bag_per_sample_weights_backward(self):
@@ -3479,14 +4891,28 @@ class TestEmbeddingBag(TestCase):
         self.assertEqual(psw.grad.shape, psw.shape)
         # psw.grad[i] = dot(grad_output[bag], weight[idx[i]])
         # since grad of out.sum() is all ones, grad_output = ones(1, 16)
-        grad_vals = [np.float32(1.0)] * 16
-        w_np = w.cpu().numpy()
-        idx_np = list(idx.cpu().numpy())
-        weight_table = [list(w_np[r]) for r in range(w_np.shape[0])]
+        grad_vals = [_f32(1.0)] * 16
+        weight_table = w.cpu().tolist()
+        idx_list = idx.cpu().tolist()
         spec_psw_grad = spec_embedding_bag_psw_backward(
-            grad_vals, weight_table, idx_np, embedding_dim=16
+            grad_vals, weight_table, idx_list, embedding_dim=16
         )
         self.assertEqual(float(spec_psw_grad[0]), psw.grad[0].item(), atol=0, rtol=0)
+
+    def test_embedding_bag_backward_weight(self):
+        # Weight gradient uses scatter_add of per-sample contributions.
+        w = torch.randn(100, 16, device="cuda", requires_grad=True)
+        idx = torch.randint(0, 100, (20,), device="cuda")
+        offsets = torch.tensor([0, 10], device="cuda")
+        out = torch.nn.functional.embedding_bag(
+            idx, w, offsets, mode="sum"
+        )
+        out.sum().backward()
+        grad_output = torch.ones(2, 16, device="cuda")  # grad of sum() is all ones
+        ref = ref_embedding_bag_backward_weight(
+            grad_output, idx, offsets,
+            num_embeddings=100, embedding_dim=16)
+        self.assertEqual(ref, w.grad, atol=0, rtol=0)
 
 
 class TestAveragePool2d(TestCase):
@@ -3510,26 +4936,21 @@ class TestAveragePool2d(TestCase):
         self.assertEqual(result.shape, (8, 64, 32, 32))
         # Spec: bitwise match (sequential window loop for center element)
         b, c, oh, ow = 0, 0, 16, 16
-        window_vals = list(x[b, c, oh - 1:oh + 2, ow - 1:ow + 2].cpu().numpy().flatten())
+        window_vals = x[b, c, oh - 1:oh + 2, ow - 1:ow + 2].cpu().flatten().tolist()
         spec_val = spec_avg_pool_window(window_vals)
         self.assertEqual(spec_val, result[b, c, oh, ow].item(), atol=0, rtol=0)
 
     def test_avg_pool2d_backward(self):
-        # Backward: each input thread sums contributions from overlapping output
-        # windows. Sequential loop — no inter-thread reduction.
-        x = torch.randn(8, 64, 32, 32, device="cuda")
-        grad_output = torch.randn(8, 64, 32, 32, device="cuda")
+        x = torch.randn(2, 4, 8, 8, device="cuda")
+        grad_output = torch.randn(2, 4, 8, 8, device="cuda")
         result = torch.ops.aten.avg_pool2d_backward(
             grad_output, x, [3, 3], [1, 1], [1, 1], False, True, None
         )
         self.assertEqual(result.shape, x.shape)
-        # A center element (16,16) with 3x3 kernel, stride=1, pad=1 receives
-        # grad/9 from each of the 9 output positions whose pooling window includes it.
-        # Compute on CPU to avoid comparing two CUDA trees.
-        b, c = 0, 0
-        window = grad_output[b, c, 15:18, 15:18].cpu().numpy()
-        ref = spec_avg_pool_window(list(window.flatten()))
-        self.assertEqual(float(ref), result[b, c, 16, 16].item(), atol=1e-6, rtol=0)
+        ref = ref_avg_pool2d_backward(
+            grad_output, x.shape, kH=3, kW=3,
+            sH=1, sW=1, pH=1, pW=1, count_include_pad=True)
+        self.assertEqual(ref, result, atol=0, rtol=0)
 
 
 class TestAdaptiveAveragePooling(TestCase):
@@ -3552,25 +4973,23 @@ class TestAdaptiveAveragePooling(TestCase):
         result = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1))
         self.assertEqual(result.shape, (8, 64, 1, 1))
         # Kernel does sum / kH / kW (two divisions), not sum / (kH*kW)
-        window_vals = list(x[0, 0].cpu().numpy().flatten())
-        acc = type(window_vals[0])(0)
+        window_vals = x[0, 0].cpu().flatten().tolist()
+        acc = _f32(0.0)
         for v in window_vals:
-            acc = acc + v
+            acc = _f32(acc + v)
         kH, kW = 4, 4
-        spec_val = acc / type(acc)(kH) / type(acc)(kW)
+        spec_val = _f32(_f32(acc / _f32(kH)) / _f32(kW))
         # Compiler loop unrolling changes sequential sum association
         self.assertEqual(float(spec_val), result[0, 0, 0, 0].item(), atol=1e-7, rtol=0)
 
     def test_adaptive_avg_pool2d_backward(self):
-        # Sequential per-input-element loop. No inter-thread reduction.
-        # For (1,1) output, each input element gets grad / (H*W).
         x = torch.randn(8, 64, 32, 32, device="cuda")
         grad_output = torch.randn(8, 64, 1, 1, device="cuda")
         result = torch.ops.aten._adaptive_avg_pool2d_backward(grad_output, x)
         self.assertEqual(result.shape, x.shape)
-        # grad / (H*W) is a single division, no tree involved.
-        ref = grad_output[0, 0, 0, 0].item() / (32.0 * 32.0)
-        self.assertEqual(ref, result[0, 0, 16, 16].item(), atol=0, rtol=0)
+        ref = ref_adaptive_avg_pool2d_backward(
+            grad_output, x.shape)
+        self.assertEqual(ref, result, atol=0, rtol=0)
 
 
 class TestForeachReduceOp(TestCase):
@@ -3592,15 +5011,12 @@ class TestForeachReduceOp(TestCase):
     """
 
     def test_foreach_norm(self):
-        # foreach_norm uses a fused multi-tensor kernel with a different tree
-        # from gpu_reduce_kernel's vector_norm. The two trees (fused multi-tensor
-        # block_reduce_cuh vs gpu_reduce_kernel) have different association order.
         tensors = [torch.randn(1000, device="cuda") for _ in range(3)]
         result = torch._foreach_norm(tensors, 2.0)
         self.assertEqual(len(result), 3)
         for i in range(3):
-            ref = torch.linalg.vector_norm(tensors[i], 2).item()
-            self.assertEqual(result[i].item(), ref, atol=1e-5, rtol=0)
+            ref = ref_foreach_norm_l2(tensors[i])
+            self.assertEqual(result[i].item(), ref, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
