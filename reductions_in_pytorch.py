@@ -5326,17 +5326,19 @@ class TestSegmentReduce(TestCase):
     CUDA ref: cuda/SegmentReduce.cu.
 
     === 1D (CUB path) ===
-    Uses cub::DeviceSegmentedReduce::Reduce with custom combine op.
-    Internal tree structure is CUB's auto-tuned binary tree.
+    Uses cub::DeviceSegmentedReduce::Reduce.
+    sm_100 policy: 512 threads, 16 items/thread, striped load,
+    BLOCK_REDUCE_WARP_REDUCTIONS with shfl_down low-to-high (offsets 1,2,4,8,16).
+    Thread 0 then sequentially combines valid warp aggregates.
+    CUDA ref: cub/device/dispatch/tuning/tuning_reduce.cuh:181 (sm100 float+plus),
+    cub/block/specializations/block_reduce_warp_reductions.cuh,
+    cub/warp/specializations/warp_reduce_shfl.cuh:217 (float plus ReduceStep).
 
     === Multi-dim (custom kernel) ===
     PURELY SEQUENTIAL loop per thread over segment elements:
       for j in range(offset_start, offset_end):
           acc = combine(acc, data[j])
     One thread per (segment, feature_dim) pair.
-
-    No spec provided — 1D uses CUB whose internal tree is opaque, and
-    multi-dim is trivially sequential_reduce over each segment.
     """
 
     def test_segment_reduce_1d(self):
@@ -5344,9 +5346,48 @@ class TestSegmentReduce(TestCase):
         lengths = torch.tensor([100] * 100, device="cuda")
         result = torch.segment_reduce(x, "sum", lengths=lengths)
         self.assertEqual(result.shape, (100,))
-        ref = ref_segment_reduce_sum_1d(x, lengths)
-        # CUB tree reduction — opaque internal ordering
-        self.assertEqual(ref, result, atol=1e-5, rtol=0)
+        # CUB sm_100 policy: 512 threads, striped load, shfl_down low-to-high
+        CUB_THREADS = 512
+        WARP = 32
+        add = lambda a, b: _f32(a + b)
+        zero = _f32(0.0)
+        x_list = x.cpu().tolist()
+        spec = []
+        off = 0
+        for seg in range(100):
+            N = lengths[seg].item()
+            data = x_list[off:off + N]
+            thread_vals = [zero] * CUB_THREADS
+            for t in range(N):
+                thread_vals[t] = _f32(data[t])
+            warp_aggs = []
+            for w in range(CUB_THREADS // WARP):
+                ws = w * WARP
+                wv = thread_vals[ws:ws + WARP]
+                nv = min(WARP, max(0, N - ws))
+                if nv <= 0:
+                    warp_aggs.append(zero)
+                    continue
+                last = nv - 1
+                offset = 1
+                while offset < WARP:
+                    for i in range(WARP):
+                        src = i + offset
+                        if src < WARP and src <= last:
+                            wv[i] = _f32(wv[i] + wv[src])
+                    offset *= 2
+                warp_aggs.append(wv[0])
+            total = warp_aggs[0]
+            for w in range(1, CUB_THREADS // WARP):
+                if w * WARP < N:
+                    total = _f32(total + warp_aggs[w])
+            spec.append(total)
+            off += N
+        self.assertEqual(
+            torch.tensor(spec, dtype=torch.float32),
+            result.cpu(),
+            atol=0, rtol=0,
+        )
 
     def test_segment_reduce_2d(self):
         x = torch.randn(10000, 64, device="cuda")
