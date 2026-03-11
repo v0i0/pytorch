@@ -890,6 +890,9 @@ class PallasKernel(SIMDKernel):
             return False
         if not any(not t.is_reduction for t in self.range_trees):
             return False
+        # Reductions change shapes in ways buf[...] can't express.
+        if any(t.is_reduction for t in self.range_trees):
+            return False
         for tree in self.range_trees:
             try:
                 int(tree.numel)
