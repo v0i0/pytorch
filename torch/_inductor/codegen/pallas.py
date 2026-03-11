@@ -3653,7 +3653,7 @@ from torch._inductor.runtime.runtime_utils import (
             with code.indent():
                 code.writeline(
                     f"tpu_torch_pallas.register_custom_kernel("
-                    f"'{kernel_name_str}', kernel_key, exported.mlir_module_serialized)"
+                    f"'{kernel_name_str}', kernel_key, serialized_mlir_module=exported.mlir_module_serialized)"
                 )
 
             # Build input tensor list (all non-size-var inputs)
@@ -3686,8 +3686,9 @@ from torch._inductor.runtime.runtime_utils import (
 
             code.writeline(
                 f"tpu_torch_pallas.call_custom_kernel("
-                f"input_tensors, output_shape_tensors, "
-                f"'{kernel_name_str}', kernel_key, _input_output_aliases)"
+                f"'{kernel_name_str}', kernel_key, "
+                f"inputs=input_tensors, output_shapes=output_shape_tensors, "
+                f"input_output_aliases=_input_output_aliases)"
             )
 
     def _codegen_main_entry_default(
