@@ -16,7 +16,7 @@ from torch.utils._sympy.functions import ModularIndexing
 from .. import config
 from ..ir import ComputedBuffer
 from ..runtime.runtime_utils import torch_dtype_to_jax
-from ..utils import get_fused_kernel_name, get_kernel_metadata, sympy_subs
+from ..utils import get_fused_kernel_name, get_kernel_metadata
 from ..virtualized import V
 from .block_analysis import BlockPatternMatcher
 from .common import (
@@ -3549,11 +3549,14 @@ from torch._inductor.runtime.runtime_utils import (
 
     def _compute_block_ptr_specs(  # noqa: B950
         self, ctx: _CodegenContext
-    ) -> tuple[
-        tuple[int, ...],
-        list[tuple[tuple[int, ...], str]],
-        list[tuple[tuple[int, ...], str]],
-    ] | None:
+    ) -> (
+        tuple[
+            tuple[int, ...],
+            list[tuple[tuple[int, ...], str]],
+            list[tuple[tuple[int, ...], str]],
+        ]
+        | None
+    ):
         """Compute grid, tile sizes, and per-buffer BlockSpecs.
 
         Uses the output buffer shape as the reference for tiling.  Tile
@@ -3672,9 +3675,7 @@ from torch._inductor.runtime.runtime_utils import (
                     buf_name = gn
                     break
             if buf_name is None and param.endswith("_alias"):
-                buf_name = ctx.output_buffer_lookup.get(
-                    param.removesuffix("_alias")
-                )
+                buf_name = ctx.output_buffer_lookup.get(param.removesuffix("_alias"))
             if buf_name is None:
                 return None
             spec = _derive_spec(buf_name)
@@ -3693,6 +3694,7 @@ from torch._inductor.runtime.runtime_utils import (
             out_specs.append(spec)
 
         return grid, in_specs, out_specs
+
     def _codegen_block_ptr_specs(self, ctx: _CodegenContext) -> None:
         """Emit BlockSpec and grid code from BlockPatternMatcher analysis."""
         result = self._compute_block_ptr_specs(ctx)
@@ -3703,11 +3705,19 @@ from torch._inductor.runtime.runtime_utils import (
         code = ctx.code
         code.writeline(f"_grid = ({', '.join(str(g) for g in grid)},)")
         for i, (bs, im) in enumerate(in_specs):
-            code.writeline(f"_in_spec_{i} = pl.BlockSpec(({', '.join(str(s) for s in bs)},), {im})")
-        code.writeline(f"in_specs_pallas = ({', '.join(f'_in_spec_{i}' for i in range(len(in_specs)))},)")
+            bs_str = ", ".join(str(s) for s in bs)
+            code.writeline(
+                f"_in_spec_{i} = pl.BlockSpec(({bs_str},), {im})"
+            )
+        specs_str = ", ".join(f"_in_spec_{i}" for i in range(len(in_specs)))
+        code.writeline(f"in_specs_pallas = ({specs_str},)")
         for i, (bs, im) in enumerate(out_specs):
-            code.writeline(f"_out_spec_{i} = pl.BlockSpec(({', '.join(str(s) for s in bs)},), {im})")
-        code.writeline(f"out_specs_pallas = ({', '.join(f'_out_spec_{i}' for i in range(len(out_specs)))},)")
+            bs_str = ", ".join(str(s) for s in bs)
+            code.writeline(
+                f"_out_spec_{i} = pl.BlockSpec(({bs_str},), {im})"
+            )
+        specs_str = ", ".join(f"_out_spec_{i}" for i in range(len(out_specs)))
+        code.writeline(f"out_specs_pallas = ({specs_str},)")
 
     def _codegen_tiled_specs(self, ctx: _CodegenContext) -> None:
         """Generate tiled BlockSpec and grid variables for CPU/TPU.
