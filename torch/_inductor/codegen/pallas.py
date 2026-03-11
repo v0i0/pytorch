@@ -3702,6 +3702,10 @@ from torch._inductor.runtime.runtime_utils import (
         )
         with code.indent():
             code.writeline("jax.config.update('jax_enable_x64', True)")
+            if ctx.interpret_is_cpu:
+                code.writeline(
+                    "jax.config.update('jax_default_device', jax.devices('cpu')[0])"
+                )
             code.writeline("jax.clear_caches()")
             if ctx.alias_params:
                 code.writeline("# Convert Torch -> JAX for donated outputs")
