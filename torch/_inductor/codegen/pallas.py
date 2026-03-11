@@ -16,7 +16,7 @@ from torch.utils._sympy.functions import ModularIndexing
 from .. import config
 from ..ir import ComputedBuffer
 from ..runtime.runtime_utils import torch_dtype_to_jax
-from ..utils import get_fused_kernel_name, get_kernel_metadata
+from ..utils import get_fused_kernel_name, get_kernel_metadata, sympy_subs
 from ..virtualized import V
 from .block_analysis import BlockPatternMatcher
 from .common import (
@@ -880,6 +880,62 @@ class PallasKernel(SIMDKernel):
         self.has_flatten_indexing = False
         # Track input buffers that are accessed with transposed last-2 dims
         self.transposed_input_buffers: OrderedSet[str] = OrderedSet()
+        self.store_index_exprs: dict[str, sympy.Expr] = {}
+        self.use_block_ptr = self._can_use_block_ptr_pre()
+
+    def _can_use_block_ptr_pre(self) -> bool:
+        if self.is_gpu:
+            return False
+        if not self.range_trees:
+            return False
+        if not any(not t.is_reduction for t in self.range_trees):
+            return False
+        for tree in self.range_trees:
+            try:
+                int(tree.numel)
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def finalize_indexing(self, indices: Sequence[sympy.Expr]) -> None:
+        if not self.use_block_ptr:
+            return
+        for index in indices:
+            if self._has_indirect_vars(index):
+                self.use_block_ptr = False
+                return
+        # Find the reference shape (highest-ndim output) from scheduler writes.
+        ref_shape: list[int] = []
+        for node in self.features.scheduler_nodes():
+            for dep in node.read_writes.writes:
+                buf_obj = V.graph.get_buffer(dep.name)
+                if buf_obj is None:
+                    continue
+                int_size = [self._safe_int(s) for s in buf_obj.get_size()]
+                if any(s is None for s in int_size):
+                    self.use_block_ptr = False
+                    return
+                if len(int_size) > len(ref_shape):
+                    ref_shape = int_size  # type: ignore[assignment]
+        if not ref_shape:
+            self.use_block_ptr = False
+            return
+        # All buffers must be broadcast-compatible with the reference.
+        for buf_name in self.features.buf_accesses():
+            buf_obj = V.graph.get_buffer(buf_name)
+            if buf_obj is None:
+                continue
+            buf_size = buf_obj.get_size()
+            if len(buf_size) == 0:
+                continue
+            int_size = [self._safe_int(s) for s in buf_size]
+            if any(s is None for s in int_size):
+                self.use_block_ptr = False
+                return
+            for a, b in zip(reversed(int_size), reversed(ref_shape)):
+                if a != b and a != 1 and b != 1:
+                    self.use_block_ptr = False
+                    return
 
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
@@ -2160,6 +2216,9 @@ class PallasKernel(SIMDKernel):
         # Track the load index expression for argmax/argmin axis detection
         self.load_index_exprs[name] = index
 
+        if self.use_block_ptr:
+            return self.cse.generate(self.compute, f"{buf}[...]", dtype=dtype)
+
         # Get base index expression
         index_str, needs_flatten = self._get_index_expr(index)
 
@@ -2396,10 +2455,24 @@ class PallasKernel(SIMDKernel):
             raise Unsupported(f"pallas store mode '{mode}' not supported")
         out = self.args.output(name)
         self.store_buffer_names.add(name)
+        self.store_index_exprs[name] = index
 
         # Check if this is a scalar output (reduction to scalar)
         buf = V.graph.get_buffer(name)
         is_scalar = buf is not None and len(buf.get_size()) == 0
+
+        if self.use_block_ptr and not is_scalar:
+            store_lines = [
+                f"_val = jnp.asarray({value})",
+                (
+                    f"{out}[...] = jnp.full({out}.shape, _val) if _val.ndim == 0"
+                    f" else (_val.reshape({out}.shape) if _val.shape != {out}.shape else _val)"
+                ),
+            ]
+            for line in store_lines:
+                self.stores.writeline(line)
+                self.store_with_output.append((out, line))
+            return
 
         if is_scalar:
             store_lines = [
@@ -2958,6 +3031,7 @@ class PallasKernel(SIMDKernel):
         # before generating the kernel signature.
         kernel_body = IndentedBuffer()
         with kernel_body.indent():
+            # With block_ptr, loads/stores don't use iteration vars (buf[...]).
             self._codegen_iteration_vars(kernel_body, ctx)
 
             for line in self.compute._lines:
@@ -3068,9 +3142,11 @@ class PallasKernel(SIMDKernel):
                     "    for shape, dtype in zip(_pallas_out_shapes, out_dtypes)"
                 )
                 code.writeline(")")
-                if self.tile_cpu_tpu:
+                if self.use_block_ptr:
+                    self._codegen_block_ptr_specs(ctx)
+                if not self.use_block_ptr and self.tile_cpu_tpu:
                     self._codegen_tiled_specs(ctx)
-                else:
+                elif not self.use_block_ptr:
                     code.writeline("indexer = lambda n: lambda i: [jnp.int32(i)] * n")
                     code.writeline("out_specs_pallas = tuple(")
                     code.writeline("    pl.BlockSpec(shape, indexer(len(shape)))")
@@ -3471,6 +3547,168 @@ from torch._inductor.runtime.runtime_utils import (
             "        return pallas_gpu_unpad_results(_result, out_shapes, _is_scalar)"
         )
 
+    def _compute_block_ptr_specs(  # noqa: B950
+        self, ctx: _CodegenContext
+    ) -> tuple[
+        tuple[int, ...],
+        list[tuple[tuple[int, ...], str]],
+        list[tuple[tuple[int, ...], str]],
+    ] | None:
+        """Compute grid, tile sizes, and per-buffer BlockSpecs.
+
+        Uses the output buffer shape as the reference for tiling.  Tile
+        sizes respect TPU alignment (last dim multiple of 128,
+        second-to-last multiple of 8).  Each tiled dimension becomes a
+        grid axis.  Buffers with fewer dims are right-aligned (broadcast).
+        """
+        from ..runtime.runtime_utils import (
+            _pallas_tile_size,
+            _TPU_ALIGN_LAST,
+            _TPU_ALIGN_SECOND_LAST,
+        )
+
+        # Incompatible with iteration variable usage (e.g. index_expr).
+        if self.used_iter_vars:
+            return None
+
+        # Determine the reference output shape (highest-ndim output).
+        ref_shape: list[int] = []
+        out_bufs = list(self.args.output_buffers.keys())
+        for buf_name in out_bufs:
+            info = self._get_buffer_info(buf_name)
+            if info is None:
+                return None
+            _, buf_size, _, _, _ = info
+            int_size = [self._safe_int(s) for s in buf_size]
+            if any(s is None for s in int_size):
+                return None
+            if len(int_size) > len(ref_shape):
+                ref_shape = int_size  # type: ignore[assignment]
+        if not ref_shape:
+            return None
+
+        ref_nd = len(ref_shape)
+
+        # Validate all buffers are compatible (same ndim or broadcastable).
+        all_bufs = list(self.args.input_buffers.keys()) + out_bufs
+        for buf_name in all_bufs:
+            info = self._get_buffer_info(buf_name)
+            if info is None:
+                return None
+            _, buf_size, _, _, _ = info
+            if len(buf_size) == 0:
+                continue  # scalar
+            int_size = [self._safe_int(s) for s in buf_size]
+            if any(s is None for s in int_size):
+                return None
+            for a, b in zip(reversed(int_size), reversed(ref_shape)):
+                if a != b and a != 1 and b != 1:
+                    return None
+
+        # Compute tile sizes for each reference dimension.
+        is_tpu = V.graph.get_current_device_or_throw().type == "tpu"
+        tile_sizes: list[int] = []
+        grid_sizes: list[int] = []
+        axis_to_grid: dict[int, int] = {}
+
+        for ax in range(ref_nd):
+            dim = ref_shape[ax]
+            pos_from_end = ref_nd - 1 - ax
+            align = _TPU_ALIGN_LAST if pos_from_end == 0 else _TPU_ALIGN_SECOND_LAST
+            t = _pallas_tile_size(dim, align, is_tpu=is_tpu)
+            tile_sizes.append(t)
+            grid_sizes.append(math.ceil(dim / t))
+            axis_to_grid[ax] = len(axis_to_grid)
+
+        grid = tuple(grid_sizes)
+        n_grid_dims = len(grid)
+
+        def _derive_spec(buf_name: str) -> tuple[tuple[int, ...], str] | None:
+            buf_obj = V.graph.get_buffer(buf_name)
+            if buf_obj is None:
+                return None
+            buf_size = buf_obj.get_size()
+            if len(buf_size) == 0:
+                gv = ", ".join(f"_g{k}" for k in range(n_grid_dims))
+                return (1,), f"lambda {gv}: (jnp.int32(0),)"
+            int_sizes: list[int] = []
+            for s in buf_size:
+                try:
+                    int_sizes.append(int(s))
+                except (TypeError, ValueError):
+                    return None
+
+            buf_nd = len(int_sizes)
+            offset = ref_nd - buf_nd
+            block_shape: list[int] = []
+            index_parts: list[str] = []
+            gv_list = [f"_g{k}" for k in range(n_grid_dims)]
+
+            for buf_dim_i in range(buf_nd):
+                ref_ax = offset + buf_dim_i
+                buf_s = int_sizes[buf_dim_i]
+                if ref_ax < 0 or ref_ax >= ref_nd:
+                    block_shape.append(buf_s)
+                    index_parts.append("0")
+                elif buf_s == 1:
+                    block_shape.append(1)
+                    index_parts.append("0")
+                elif buf_s == ref_shape[ref_ax]:
+                    grid_dim = axis_to_grid[ref_ax]
+                    block_shape.append(tile_sizes[ref_ax])
+                    index_parts.append(gv_list[grid_dim])
+                else:
+                    return None
+
+            gv = ", ".join(gv_list) if gv_list else "_"
+            idx_str = ", ".join(f"jnp.int32({p})" for p in index_parts)
+            return tuple(block_shape), f"lambda {gv}: ({idx_str},)"
+
+        in_specs: list[tuple[tuple[int, ...], str]] = []
+        for param in ctx.kernel_input_params:
+            buf_name = None
+            for gn, inn in self.args.input_buffers.items():
+                if inn == param:
+                    buf_name = gn
+                    break
+            if buf_name is None and param.endswith("_alias"):
+                buf_name = ctx.output_buffer_lookup.get(
+                    param.removesuffix("_alias")
+                )
+            if buf_name is None:
+                return None
+            spec = _derive_spec(buf_name)
+            if spec is None:
+                return None
+            in_specs.append(spec)
+
+        out_specs: list[tuple[tuple[int, ...], str]] = []
+        for param in ctx.output_params:
+            buf_name = ctx.output_buffer_lookup.get(param)
+            if buf_name is None:
+                return None
+            spec = _derive_spec(buf_name)
+            if spec is None:
+                return None
+            out_specs.append(spec)
+
+        return grid, in_specs, out_specs
+    def _codegen_block_ptr_specs(self, ctx: _CodegenContext) -> None:
+        """Emit BlockSpec and grid code from BlockPatternMatcher analysis."""
+        result = self._compute_block_ptr_specs(ctx)
+        if result is None:
+            self.use_block_ptr = False
+            return
+        grid, in_specs, out_specs = result
+        code = ctx.code
+        code.writeline(f"_grid = ({', '.join(str(g) for g in grid)},)")
+        for i, (bs, im) in enumerate(in_specs):
+            code.writeline(f"_in_spec_{i} = pl.BlockSpec(({', '.join(str(s) for s in bs)},), {im})")
+        code.writeline(f"in_specs_pallas = ({', '.join(f'_in_spec_{i}' for i in range(len(in_specs)))},)")
+        for i, (bs, im) in enumerate(out_specs):
+            code.writeline(f"_out_spec_{i} = pl.BlockSpec(({', '.join(str(s) for s in bs)},), {im})")
+        code.writeline(f"out_specs_pallas = ({', '.join(f'_out_spec_{i}' for i in range(len(out_specs)))},)")
+
     def _codegen_tiled_specs(self, ctx: _CodegenContext) -> None:
         """Generate tiled BlockSpec and grid variables for CPU/TPU.
 
@@ -3537,7 +3775,7 @@ from torch._inductor.runtime.runtime_utils import (
         alias_map_literal: str,
     ) -> None:
         code = ctx.code
-        grid_expr = "_grid" if self.tile_cpu_tpu else "(1,)"
+        grid_expr = "_grid" if (self.use_block_ptr or self.tile_cpu_tpu) else "(1,)"
         code.writeline("_result = pl.pallas_call(")
         code.writeline("    " + kernel_arg)
         code.writeline("    out_shape=out_shapes_pallas,")
