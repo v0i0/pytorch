@@ -3706,16 +3706,12 @@ from torch._inductor.runtime.runtime_utils import (
         code.writeline(f"_grid = ({', '.join(str(g) for g in grid)},)")
         for i, (bs, im) in enumerate(in_specs):
             bs_str = ", ".join(str(s) for s in bs)
-            code.writeline(
-                f"_in_spec_{i} = pl.BlockSpec(({bs_str},), {im})"
-            )
+            code.writeline(f"_in_spec_{i} = pl.BlockSpec(({bs_str},), {im})")
         specs_str = ", ".join(f"_in_spec_{i}" for i in range(len(in_specs)))
         code.writeline(f"in_specs_pallas = ({specs_str},)")
         for i, (bs, im) in enumerate(out_specs):
             bs_str = ", ".join(str(s) for s in bs)
-            code.writeline(
-                f"_out_spec_{i} = pl.BlockSpec(({bs_str},), {im})"
-            )
+            code.writeline(f"_out_spec_{i} = pl.BlockSpec(({bs_str},), {im})")
         specs_str = ", ".join(f"_out_spec_{i}" for i in range(len(out_specs)))
         code.writeline(f"out_specs_pallas = ({specs_str},)")
 
