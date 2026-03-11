@@ -1195,7 +1195,7 @@ class PallasKernel(SIMDKernel):
             n_blocks = buf_shape[d] // stride
             if skip >= n_blocks:
                 return None
-            output_numel_expected *= (n_blocks - skip)
+            output_numel_expected *= n_blocks - skip
             decomposed.append((stride, offset, skip))
 
         output_numel, _ = self._compute_output_numel_from_index(index)
@@ -1221,16 +1221,14 @@ class PallasKernel(SIMDKernel):
         return decomposed
 
     @staticmethod
-    def _strided_load_expr(
-        buf: str, decomp: list[tuple[int, int, int]]
-    ) -> str:
+    def _strided_load_expr(buf: str, decomp: list[tuple[int, int, int]]) -> str:
         """Build ``buf[:, :, offset]`` for strided dims, ``:`` for others."""
         parts: list[str] = []
         for stride, offset, _skip in decomp:
             if stride == 1:
                 parts.append(":")
             else:
-                parts.append(":")       # the halved dim
+                parts.append(":")  # the halved dim
                 parts.append(str(offset))  # static index into stride dim
         return f"{buf}[{', '.join(parts)}]"
 
@@ -1274,9 +1272,7 @@ class PallasKernel(SIMDKernel):
                         else:
                             slice_parts.append(f"{skip}:" if skip > 0 else ":")
                             slice_parts.append(":")
-                    code.writeline(
-                        f"{param} = {param}[{', '.join(slice_parts)}]"
-                    )
+                    code.writeline(f"{param} = {param}[{', '.join(slice_parts)}]")
 
     @staticmethod
     def _c_contiguous_strides(shape: list[int]) -> list[int]:
@@ -2402,7 +2398,9 @@ class PallasKernel(SIMDKernel):
             )
 
             # Build the load expression
-            load_expr = self._build_load_expr(buf, name, index, index_str, needs_flatten)
+            load_expr = self._build_load_expr(
+                buf, name, index, index_str, needs_flatten
+            )
 
         # Handle intermediate buffer squeezing for correct broadcasting
         if not needs_flatten and index_str == "...":
