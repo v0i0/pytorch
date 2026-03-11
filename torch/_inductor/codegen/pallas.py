@@ -3637,7 +3637,7 @@ from torch._inductor.runtime.runtime_utils import (
             buf_size = buf_obj.get_size()
             if len(buf_size) == 0:
                 gv = ", ".join(f"_g{k}" for k in range(n_grid_dims))
-                return (1,), f"lambda {gv}: (jnp.int32(0),)"
+                return (), f"lambda {gv}: ()"
             int_sizes: list[int] = []
             for s in buf_size:
                 try:
