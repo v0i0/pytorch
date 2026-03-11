@@ -880,7 +880,6 @@ class PallasKernel(SIMDKernel):
         self.has_flatten_indexing = False
         # Track input buffers that are accessed with transposed last-2 dims
         self.transposed_input_buffers: OrderedSet[str] = OrderedSet()
-        self.store_index_exprs: dict[str, sympy.Expr] = {}
         self.use_block_ptr = self._can_use_block_ptr_pre()
 
     def _can_use_block_ptr_pre(self) -> bool:
@@ -888,9 +887,6 @@ class PallasKernel(SIMDKernel):
             return False
         if not self.range_trees:
             return False
-        if not any(not t.is_reduction for t in self.range_trees):
-            return False
-        # Reductions change shapes in ways buf[...] can't express.
         if any(t.is_reduction for t in self.range_trees):
             return False
         for tree in self.range_trees:
@@ -907,8 +903,6 @@ class PallasKernel(SIMDKernel):
             if self._has_indirect_vars(index):
                 self.use_block_ptr = False
                 return
-            # ModularIndexing/FloorDiv indicate non-contiguous access (roll,
-            # flip, reshape, etc.) that buf[...] can't express.
             if index.has(ModularIndexing) or index.has(FloorDiv):
                 self.use_block_ptr = False
                 return
@@ -928,10 +922,7 @@ class PallasKernel(SIMDKernel):
         if not ref_shape:
             self.use_block_ptr = False
             return
-        # All buffers must tile-compatible with the reference: each dim must
-        # either match exactly or be 1 (broadcast).  A buffer dim larger than
-        # the ref dim (e.g. strided-slice input) cannot be expressed with
-        # block_ptr's buf[...] loads.
+        # All buffers must be broadcast-compatible with the reference.
         for buf_name in self.features.buf_accesses():
             buf_obj = V.graph.get_buffer(buf_name)
             if buf_obj is None:
@@ -2228,7 +2219,11 @@ class PallasKernel(SIMDKernel):
         self.load_index_exprs[name] = index
 
         if self.use_block_ptr:
-            return self.cse.generate(self.compute, f"{buf}[...]", dtype=dtype)
+            ndim = len(V.graph.get_buffer(name).get_size())
+            slice_str = ", ".join([":"] * ndim) if ndim > 0 else "..."
+            return self.cse.generate(
+                self.compute, f"{buf}[{slice_str}]", dtype=dtype
+            )
 
         # Get base index expression
         index_str, needs_flatten = self._get_index_expr(index)
@@ -2466,17 +2461,17 @@ class PallasKernel(SIMDKernel):
             raise Unsupported(f"pallas store mode '{mode}' not supported")
         out = self.args.output(name)
         self.store_buffer_names.add(name)
-        self.store_index_exprs[name] = index
-
         # Check if this is a scalar output (reduction to scalar)
         buf = V.graph.get_buffer(name)
         is_scalar = buf is not None and len(buf.get_size()) == 0
 
         if self.use_block_ptr and not is_scalar:
+            ndim = len(buf.get_size())
+            slice_str = ", ".join([":"] * ndim) if ndim > 0 else "..."
             store_lines = [
                 f"_val = jnp.asarray({value})",
                 (
-                    f"{out}[...] = jnp.full({out}.shape, _val) if _val.ndim == 0"
+                    f"{out}[{slice_str}] = jnp.full({out}.shape, _val) if _val.ndim == 0"
                     f" else (_val.reshape({out}.shape) if _val.shape != {out}.shape else _val)"
                 ),
             ]
@@ -3042,7 +3037,7 @@ class PallasKernel(SIMDKernel):
         # before generating the kernel signature.
         kernel_body = IndentedBuffer()
         with kernel_body.indent():
-            # With block_ptr, loads/stores don't use iteration vars (buf[...]).
+            # With block_ptr, loads/stores use explicit ndim slicing (buf[:, :]).
             self._codegen_iteration_vars(kernel_body, ctx)
 
             for line in self.compute._lines:
