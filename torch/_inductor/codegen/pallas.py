@@ -3707,15 +3707,18 @@ from torch._inductor.runtime.runtime_utils import (
             return
         grid, in_specs, out_specs = result
         code = ctx.code
-        code.writeline(f"_grid = ({', '.join(str(g) for g in grid)},)")
+        def _fmt_tuple(vals: tuple[int, ...]) -> str:
+            if not vals:
+                return "()"
+            return f"({', '.join(str(v) for v in vals)},)"
+
+        code.writeline(f"_grid = {_fmt_tuple(grid)}")
         for i, (bs, im) in enumerate(in_specs):
-            bs_str = ", ".join(str(s) for s in bs)
-            code.writeline(f"_in_spec_{i} = pl.BlockSpec(({bs_str},), {im})")
+            code.writeline(f"_in_spec_{i} = pl.BlockSpec({_fmt_tuple(bs)}, {im})")
         specs_str = ", ".join(f"_in_spec_{i}" for i in range(len(in_specs)))
         code.writeline(f"in_specs_pallas = ({specs_str},)")
         for i, (bs, im) in enumerate(out_specs):
-            bs_str = ", ".join(str(s) for s in bs)
-            code.writeline(f"_out_spec_{i} = pl.BlockSpec(({bs_str},), {im})")
+            code.writeline(f"_out_spec_{i} = pl.BlockSpec({_fmt_tuple(bs)}, {im})")
         specs_str = ", ".join(f"_out_spec_{i}" for i in range(len(out_specs)))
         code.writeline(f"out_specs_pallas = ({specs_str},)")
 
