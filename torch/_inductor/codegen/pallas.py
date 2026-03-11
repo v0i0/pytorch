@@ -3707,6 +3707,7 @@ from torch._inductor.runtime.runtime_utils import (
             return
         grid, in_specs, out_specs = result
         code = ctx.code
+
         def _fmt_tuple(vals: tuple[int, ...]) -> str:
             if not vals:
                 return "()"
