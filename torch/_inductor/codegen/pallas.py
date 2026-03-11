@@ -920,7 +920,10 @@ class PallasKernel(SIMDKernel):
         if not ref_shape:
             self.use_block_ptr = False
             return
-        # All buffers must be broadcast-compatible with the reference.
+        # All buffers must tile-compatible with the reference: each dim must
+        # either match exactly or be 1 (broadcast).  A buffer dim larger than
+        # the ref dim (e.g. strided-slice input) cannot be expressed with
+        # block_ptr's buf[...] loads.
         for buf_name in self.features.buf_accesses():
             buf_obj = V.graph.get_buffer(buf_name)
             if buf_obj is None:
@@ -933,7 +936,7 @@ class PallasKernel(SIMDKernel):
                 self.use_block_ptr = False
                 return
             for a, b in zip(reversed(int_size), reversed(ref_shape)):
-                if a != b and a != 1 and b != 1:
+                if a != b and a != 1:
                     self.use_block_ptr = False
                     return
 
@@ -3592,7 +3595,8 @@ from torch._inductor.runtime.runtime_utils import (
 
         ref_nd = len(ref_shape)
 
-        # Validate all buffers are compatible (same ndim or broadcastable).
+        # Validate all buffers are tile-compatible: each dim must match ref
+        # or be 1 (broadcast).  Dims larger than ref (strided access) bail.
         all_bufs = list(self.args.input_buffers.keys()) + out_bufs
         for buf_name in all_bufs:
             info = self._get_buffer_info(buf_name)
@@ -3605,7 +3609,7 @@ from torch._inductor.runtime.runtime_utils import (
             if any(s is None for s in int_size):
                 return None
             for a, b in zip(reversed(int_size), reversed(ref_shape)):
-                if a != b and a != 1 and b != 1:
+                if a != b and a != 1:
                     return None
 
         # Compute tile sizes for each reference dimension.
