@@ -818,7 +818,7 @@ class _CodegenContext:
     code: IndentedBuffer
     kernel_name: str
     is_tpu: bool
-    interpret_is_cpu: bool
+    interpret: bool
     interpret_literal: str
     kernel_params: list[str]
     pure_out_params: list[str]
@@ -2896,8 +2896,8 @@ class PallasKernel(SIMDKernel):
 
         kernel_name = name or "<KERNEL_NAME>"
         is_tpu = V.graph.get_current_device_or_throw().type == "tpu"
-        interpret_is_cpu = V.graph.get_current_device_or_throw().type == "cpu"
-        interpret_literal = "True" if interpret_is_cpu else "False"
+        interpret = not is_tpu and not self.is_gpu
+        interpret_literal = "True" if interpret else "False"
 
         aliasable_flags: dict[str, bool] = {}
         for param in pure_out_params:
@@ -2913,27 +2913,27 @@ class PallasKernel(SIMDKernel):
         non_alias_out_set = OrderedSet(
             [name for name, flag in aliasable_flags.items() if not flag]
         )
-        # On CPU (interpret=True), pallas_call returns new arrays so we must
-        # copy back every output.  On TPU, call_custom_kernel with
-        # input_output_aliases handles donation (zero-copy), so no copy is
-        # needed.  On CUDA, aliased outputs are mutated in-place by the
-        # donated-buffer mechanism so only non-aliased outputs need a copy.
-        if interpret_is_cpu:
-            copy_output_indices = list(range(len(output_params)))
-        elif is_tpu:
+        # TPU: call_custom_kernel with input_output_aliases handles donation
+        # (zero-copy), so no copy is needed.  CUDA: aliased outputs are
+        # mutated in-place by the donated-buffer mechanism so only non-aliased
+        # outputs need a copy.  Interpret mode (CPU): pallas_call returns new
+        # arrays so we must copy back every output.
+        if is_tpu:
             copy_output_indices = []
-        else:
+        elif self.is_gpu:
             copy_output_indices = [
                 idx
                 for idx, name in enumerate(output_params)
                 if name in non_alias_out_set
             ]
+        else:
+            copy_output_indices = list(range(len(output_params)))
 
         ctx = _CodegenContext(
             code=code,
             kernel_name=kernel_name,
             is_tpu=is_tpu,
-            interpret_is_cpu=interpret_is_cpu,
+            interpret=interpret,
             interpret_literal=interpret_literal,
             kernel_params=kernel_params,
             pure_out_params=pure_out_params,
@@ -3130,7 +3130,7 @@ from torch._inductor.runtime.runtime_utils import (
         if ctx.is_tpu:
             imports += "\nimport jax.export"
             imports += "\nfrom torch_tpu._internal.pallas import tpu_torch_pallas"
-        elif not ctx.interpret_is_cpu:
+        elif self.is_gpu:
             imports += "\nfrom jax.experimental.pallas import mosaic_gpu as plgpu"
         ctx.code.splice(imports, strip=True)
 
@@ -3705,10 +3705,10 @@ from torch._inductor.runtime.runtime_utils import (
             if ctx.alias_params:
                 code.writeline("# Convert Torch -> JAX for donated outputs")
                 for alias_name in ctx.alias_params:
-                    # On CPU/TPU, alias outputs may be non-contiguous (e.g.
-                    # torch.cat slices) and JAX's from_dlpack rejects
+                    # In interpret mode, alias outputs may be non-contiguous
+                    # (e.g. torch.cat slices) and JAX's from_dlpack rejects
                     # non-trivially strided tensors.  Making them contiguous
-                    # is safe because CPU/TPU already copies all results back
+                    # is safe because interpret mode copies all results back
                     # via copy_output_indices.  On CUDA, the donated-buffer
                     # mechanism requires the original buffer for in-place
                     # mutation, so we cannot make a contiguous copy.
@@ -3716,7 +3716,7 @@ from torch._inductor.runtime.runtime_utils import (
                         code,
                         alias_name,
                         ctx.is_tpu,
-                        contiguous=ctx.interpret_is_cpu,
+                        contiguous=ctx.interpret,
                     )
             code.writeline("# Convert Torch -> JAX for in-place tensors")
             for ptr in ctx.pointer_tail:
