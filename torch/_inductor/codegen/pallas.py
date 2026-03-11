@@ -11,7 +11,7 @@ import sympy  # noqa: TC002
 
 import torch  # noqa: TC001
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from .. import config
 from ..ir import ComputedBuffer
@@ -902,6 +902,11 @@ class PallasKernel(SIMDKernel):
             return
         for index in indices:
             if self._has_indirect_vars(index):
+                self.use_block_ptr = False
+                return
+            # ModularIndexing/FloorDiv indicate non-contiguous access (roll,
+            # flip, reshape, etc.) that buf[...] can't express.
+            if index.has(ModularIndexing) or index.has(FloorDiv):
                 self.use_block_ptr = False
                 return
         # Find the reference shape (highest-ndim output) from scheduler writes.
