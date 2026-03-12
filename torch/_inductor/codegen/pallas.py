@@ -881,6 +881,7 @@ class PallasKernel(SIMDKernel):
         # Track input buffers that are accessed with transposed last-2 dims
         self.transposed_input_buffers: OrderedSet[str] = OrderedSet()
         self.use_block_ptr = self._can_use_block_ptr_pre()
+        self._block_ptr_ref_shape: list[int] = []
 
     def _can_use_block_ptr_pre(self) -> bool:
         if self.is_gpu:
@@ -938,6 +939,7 @@ class PallasKernel(SIMDKernel):
                 if a != b and a != 1:
                     self.use_block_ptr = False
                     return
+        self._block_ptr_ref_shape = ref_shape
 
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
@@ -2756,6 +2758,8 @@ class PallasKernel(SIMDKernel):
         - Flatten-based indexing
         - Scatter outputs (indirect indexing complicates tile boundaries)
         """
+        if self.use_block_ptr:
+            return False
         if self.is_gpu:
             return False
         if self.has_flatten_indexing:
@@ -3150,9 +3154,9 @@ class PallasKernel(SIMDKernel):
                 code.writeline(")")
                 if self.use_block_ptr:
                     self._codegen_block_ptr_specs(ctx)
-                if not self.use_block_ptr and self.tile_cpu_tpu:
+                elif self.tile_cpu_tpu:
                     self._codegen_tiled_specs(ctx)
-                elif not self.use_block_ptr:
+                else:
                     code.writeline("indexer = lambda n: lambda i: [jnp.int32(i)] * n")
                     code.writeline("out_specs_pallas = tuple(")
                     code.writeline("    pl.BlockSpec(shape, indexer(len(shape)))")
@@ -3569,6 +3573,9 @@ from torch._inductor.runtime.runtime_utils import (
         sizes respect TPU alignment (last dim multiple of 128,
         second-to-last multiple of 8).  Each tiled dimension becomes a
         grid axis.  Buffers with fewer dims are right-aligned (broadcast).
+
+        Assumes finalize_indexing already validated buffer compatibility
+        and stored the reference shape in self._block_ptr_ref_shape.
         """
         from ..runtime.runtime_utils import (
             _pallas_tile_size,
@@ -3576,44 +3583,8 @@ from torch._inductor.runtime.runtime_utils import (
             _TPU_ALIGN_SECOND_LAST,
         )
 
-        # Incompatible with iteration variable usage (e.g. index_expr).
-        if self.used_iter_vars:
-            return None
-
-        # Determine the reference output shape (highest-ndim output).
-        ref_shape: list[int] = []
-        out_bufs = list(self.args.output_buffers.keys())
-        for buf_name in out_bufs:
-            info = self._get_buffer_info(buf_name)
-            if info is None:
-                return None
-            _, buf_size, _, _, _ = info
-            int_size = [self._safe_int(s) for s in buf_size]
-            if any(s is None for s in int_size):
-                return None
-            if len(int_size) > len(ref_shape):
-                ref_shape = int_size  # type: ignore[assignment]
-        if not ref_shape:
-            return None
-
+        ref_shape = self._block_ptr_ref_shape
         ref_nd = len(ref_shape)
-
-        # Validate all buffers are tile-compatible: each dim must match ref
-        # or be 1 (broadcast).  Dims larger than ref (strided access) bail.
-        all_bufs = list(self.args.input_buffers.keys()) + out_bufs
-        for buf_name in all_bufs:
-            info = self._get_buffer_info(buf_name)
-            if info is None:
-                return None
-            _, buf_size, _, _, _ = info
-            if len(buf_size) == 0:
-                continue  # scalar
-            int_size = [self._safe_int(s) for s in buf_size]
-            if any(s is None for s in int_size):
-                return None
-            for a, b in zip(reversed(int_size), reversed(ref_shape)):
-                if a != b and a != 1:
-                    return None
 
         # Compute tile sizes for each reference dimension.
         is_tpu = V.graph.get_current_device_or_throw().type == "tpu"
@@ -3633,20 +3604,14 @@ from torch._inductor.runtime.runtime_utils import (
         grid = tuple(grid_sizes)
         n_grid_dims = len(grid)
 
-        def _derive_spec(buf_name: str) -> tuple[tuple[int, ...], str] | None:
+        def _derive_spec(buf_name: str) -> tuple[tuple[int, ...], str]:
             buf_obj = V.graph.get_buffer(buf_name)
-            if buf_obj is None:
-                return None
+            assert buf_obj is not None, f"block_ptr: buffer {buf_name} not found"
             buf_size = buf_obj.get_size()
             if len(buf_size) == 0:
                 gv = ", ".join(f"_g{k}" for k in range(n_grid_dims))
                 return (), f"lambda {gv}: ()"
-            int_sizes: list[int] = []
-            for s in buf_size:
-                try:
-                    int_sizes.append(int(s))
-                except (TypeError, ValueError):
-                    return None
+            int_sizes = [int(s) for s in buf_size]
 
             buf_nd = len(int_sizes)
             offset = ref_nd - buf_nd
@@ -3668,7 +3633,9 @@ from torch._inductor.runtime.runtime_utils import (
                     block_shape.append(tile_sizes[ref_ax])
                     index_parts.append(gv_list[grid_dim])
                 else:
-                    return None
+                    raise AssertionError(
+                        f"block_ptr: buf dim {buf_s} != ref {ref_shape[ref_ax]}"
+                    )
 
             gv = ", ".join(gv_list) if gv_list else "_"
             idx_str = ", ".join(f"jnp.int32({p})" for p in index_parts)
@@ -3685,29 +3652,21 @@ from torch._inductor.runtime.runtime_utils import (
                 buf_name = ctx.output_buffer_lookup.get(param.removesuffix("_alias"))
             if buf_name is None:
                 return None
-            spec = _derive_spec(buf_name)
-            if spec is None:
-                return None
-            in_specs.append(spec)
+            in_specs.append(_derive_spec(buf_name))
 
         out_specs: list[tuple[tuple[int, ...], str]] = []
         for param in ctx.output_params:
             buf_name = ctx.output_buffer_lookup.get(param)
             if buf_name is None:
                 return None
-            spec = _derive_spec(buf_name)
-            if spec is None:
-                return None
-            out_specs.append(spec)
+            out_specs.append(_derive_spec(buf_name))
 
         return grid, in_specs, out_specs
 
     def _codegen_block_ptr_specs(self, ctx: _CodegenContext) -> None:
         """Emit BlockSpec and grid code from BlockPatternMatcher analysis."""
         result = self._compute_block_ptr_specs(ctx)
-        if result is None:
-            self.use_block_ptr = False
-            return
+        assert result is not None
         grid, in_specs, out_specs = result
         code = ctx.code
 
