@@ -894,6 +894,9 @@ class PallasKernel(SIMDKernel):
         # Buffers that already use flatten+gather indexing; strided
         # decomposition must not reshape these (it would break flat offsets).
         self.flatten_indexed_buffers: OrderedSet[str] = OrderedSet()
+        # Buffers whose load is a pure flip: map graph buffer name -> tuple of
+        # buffer axes that should be reversed after the buf[...] load.
+        self.flipped_input_axes: dict[str, tuple[int, ...]] = {}
 
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
@@ -2138,6 +2141,108 @@ class PallasKernel(SIMDKernel):
             slice_str = f"{prefix}{offset_val}::{stride}"
         return slice_str, False
 
+    def _try_flip_load(
+        self,
+        name: str,
+        index: sympy.Expr,
+        index_str: str,
+        needs_flatten: bool,
+    ) -> tuple[str, bool]:
+        """Detect flip/reverse indexing and convert to jnp.flip on buf[...].
+
+        For a flat index like 5 + (-1)*x0 + 6*x1 on buffer shape
+        (1, 2, 6, 6) (C-strides [72, 36, 6, 1]):
+          - x0 coefficient -1: abs(-1) == stride[3] -> flip axis 3
+          - x1 coefficient  6: 6 == stride[2] -> normal
+          - constant offset 5 == (6-1)*1 from the flipped dim
+
+        When the pattern matches, records flip axes in
+        self.flipped_input_axes and returns ("...", False) so
+        _build_load_expr can emit jnp.flip(buf[...], axis=...).
+        """
+        if not needs_flatten:
+            return index_str, needs_flatten
+
+        if self._has_indirect_vars(index) or index.has(ModularIndexing):
+            return index_str, needs_flatten
+
+        info = self._get_buffer_info(name)
+        if info is None:
+            return index_str, needs_flatten
+        _, buf_size, buf_numel, _, _ = info
+
+        buf_shape = [self._safe_int(s) for s in buf_size]
+        if any(s is None or s <= 0 for s in buf_shape):
+            return index_str, needs_flatten
+
+        c_strides = self._c_contiguous_strides(cast(list[int], buf_shape))
+        ndim = len(buf_shape)
+
+        # Build a map from stride value to dim index (skip size-1 dims).
+        stride_to_dim: dict[int, int] = {}
+        for d in range(ndim):
+            if buf_shape[d] > 1 and c_strides[d] not in stride_to_dim:
+                stride_to_dim[c_strides[d]] = d
+
+        used_vars = self._get_used_iter_vars(index)
+        if not used_vars:
+            return index_str, needs_flatten
+
+        has_any_negative = False
+        flip_dims: list[int] = []
+        remaining = V.graph.sizevars.simplify(index)
+        iter_numel = 1
+
+        for var in used_vars:
+            var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(
+                remaining, var
+            )
+            coeff = BlockPatternMatcher.match_affine_block_expr(var_expr, var)
+            if coeff is None:
+                return index_str, needs_flatten
+            coeff_int = self._safe_int(coeff)
+            if coeff_int is None or coeff_int == 0:
+                return index_str, needs_flatten
+
+            abs_coeff = abs(coeff_int)
+            dim = stride_to_dim.get(abs_coeff)
+            if dim is None:
+                return index_str, needs_flatten
+
+            if coeff_int < 0:
+                has_any_negative = True
+                flip_dims.append(dim)
+
+            entry = self.range_tree_nodes.get(var)
+            if entry is None:
+                return index_str, needs_flatten
+            var_len = self._safe_int(entry.length)
+            if var_len is None:
+                return index_str, needs_flatten
+            iter_numel *= var_len
+
+            remaining = V.graph.sizevars.simplify(remaining - var_expr)
+
+        if not has_any_negative:
+            return index_str, needs_flatten
+
+        # Total iteration elements must equal buffer elements.
+        if iter_numel != buf_numel:
+            return index_str, needs_flatten
+
+        # The constant remainder must equal sum of (dim_size - 1) * stride
+        # for each flipped dimension.
+        expected_offset = sum(
+            (buf_shape[d] - 1) * c_strides[d] for d in flip_dims
+        )
+        offset_val = self._safe_int(remaining)
+        if offset_val is None or offset_val != expected_offset:
+            return index_str, needs_flatten
+
+        flip_axes = tuple(sorted(flip_dims))
+        self.flipped_input_axes[name] = flip_axes
+        return "...", False
+
     @staticmethod
     def _gather_permute_expr(load_expr: str, perm: tuple[int, ...]) -> str:
         """Generate gather-based permutation instead of jnp.permute_dims.
@@ -2169,6 +2274,11 @@ class PallasKernel(SIMDKernel):
         else:
             # Direct indexing for contiguous access
             load_expr = f"{buf}[{index_str}]"
+
+            # Apply jnp.flip for buffers with detected flip axes
+            flip_axes = self.flipped_input_axes.get(name)
+            if flip_axes is not None and index_str == "...":
+                load_expr = f"jnp.flip({load_expr}, axis={flip_axes})"
 
             if index_str == "..." and not self.is_gpu:
                 perm = self._get_full_load_permutation(name, index)
@@ -2355,6 +2465,10 @@ class PallasKernel(SIMDKernel):
             if load_orig_vars != load_prep_vars or store_prep_vars == store_orig_vars:
                 continue
 
+            # Skip im2col check for loads already handled as flip
+            if buf_name in self.flipped_input_axes:
+                continue
+
             # Check if load coefficients match buffer strides
             if not self._check_load_is_strided_input(
                 buf_name, load_index, load_orig_vars
@@ -2387,14 +2501,16 @@ class PallasKernel(SIMDKernel):
 
         buf_sizes = buf.get_size()
 
-        # Get load coefficients
+        # Get load coefficients (use abs to handle flip/reverse patterns)
         load_coeffs = []
         for var in load_orig_vars:
             var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(load_index, var)
             coef = BlockPatternMatcher.match_affine_block_expr(var_expr, var)
             if coef is not None:
                 int_coef = self._safe_int(coef)
-                load_coeffs.append(int_coef if int_coef is not None else coef)
+                load_coeffs.append(
+                    abs(int_coef) if int_coef is not None else coef
+                )
 
         # Check if coefficients match buffer strides
         # Only include strides for non-trivial dimensions (size > 1)
@@ -2655,6 +2771,11 @@ class PallasKernel(SIMDKernel):
 
             # Try to emit multi-dim slice instead of flatten + gather
             index_str, needs_flatten = self._try_multidim_slice(
+                name, index, index_str, needs_flatten
+            )
+
+            # Try to convert flip/reverse indexing to jnp.flip
+            index_str, needs_flatten = self._try_flip_load(
                 name, index, index_str, needs_flatten
             )
 
