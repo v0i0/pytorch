@@ -2484,6 +2484,164 @@ class PallasKernel(SIMDKernel):
             )
         return lines
 
+    def _try_decompose_store_index(
+        self,
+        out: str,
+        name: str,
+        index: sympy.Expr,
+        value: CSEVariable,
+        mode: Any = None,
+    ) -> list[str] | None:
+        """Try to decompose a flat store index into N-D assignment.
+
+        For a buffer with shape (d0, d1, ..., dk) and a flat index like
+        coeff_a * var_a + coeff_b * var_b, checks whether the variables
+        partition the buffer dims into contiguous groups where each
+        variable's coefficient and range match the group's geometry.
+
+        Example: index = x0 + 196*x1 + 1176*x2 on buffer (2, 6, 14, 14)
+        with C-strides [1176, 196, 14, 1]:
+          - x2 coeff=1176=strides[0], range=2=shape[0], covers dim 0
+          - x1 coeff=196=strides[1], range=6=shape[1], covers dim 1
+          - x0 coeff=1, range=196=14*14, covers dims 2+3
+        Collapsed shape: (2, 6, 196) -> full array store with reshape.
+
+        Returns a list of store lines on success, or None if decomposition
+        is not possible.
+        """
+        buf = V.graph.get_buffer(name)
+        if buf is None:
+            return None
+
+        buf_size = buf.get_size()
+        ndim = len(buf_size)
+        if ndim < 2:
+            return None
+
+        buf_shape = [self._safe_int(s) for s in buf_size]
+        if any(s is None or s <= 0 for s in buf_shape):
+            return None
+
+        c_strides = self._c_contiguous_strides(buf_shape)
+        buf_numel = c_strides[0] * buf_shape[0]
+
+        used_vars = self._get_used_iter_vars(index)
+        if not used_vars:
+            return None
+
+        # If any load in this kernel uses flatten+gather, the store index
+        # remaps data in a way that a simple reshape cannot reproduce
+        # (e.g., im2col patterns). Only decompose when all loads use
+        # direct [...] or slice access.
+        if self.has_flatten_indexing:
+            return None
+
+        # Extract per-variable coefficients and ranges
+        var_info: list[tuple[sympy.Symbol, int, int]] = []
+        remaining = V.graph.sizevars.simplify(index)
+
+        for var in used_vars:
+            var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(
+                remaining, var
+            )
+            coeff = BlockPatternMatcher.match_affine_block_expr(var_expr, var)
+            if coeff is None:
+                return None
+            coeff_int = self._safe_int(coeff)
+            if coeff_int is None or coeff_int < 0:
+                return None
+
+            entry = self.range_tree_nodes.get(var)
+            if entry is None:
+                return None
+            var_range = self._safe_int(entry.length)
+            if var_range is None or var_range <= 0:
+                return None
+
+            var_info.append((var, coeff_int, var_range))
+            remaining = V.graph.sizevars.simplify(remaining - var_expr)
+
+        # Check that the constant offset is zero
+        offset_val = self._safe_int(remaining)
+        if offset_val is None or offset_val != 0:
+            return None
+
+        # Verify total elements match buffer numel
+        total_elems = 1
+        for _, _, vr in var_info:
+            total_elems *= vr
+        if total_elems != buf_numel:
+            return None
+
+        # Sort variables by coefficient descending (outermost first)
+        var_info_sorted = sorted(var_info, key=lambda x: x[1], reverse=True)
+
+        # Map each variable to a contiguous group of buffer dims.
+        # For a variable covering dims [start, end):
+        #   - range == product(buf_shape[start:end])
+        #   - coefficient == product(buf_shape[end:ndim])
+        #     i.e., c_strides[end-1] (stride of last dim in group)
+        #     which equals 1 when end == ndim.
+        collapsed_shape: list[int] = []
+        collapsed_vars: list[sympy.Symbol] = []
+        dim_cursor = 0
+
+        for var, coeff, var_range in var_info_sorted:
+            if dim_cursor >= ndim:
+                return None
+
+            # Find end_dim such that product(shape[dim_cursor:end_dim]) == var_range
+            product = 1
+            end_dim = dim_cursor
+            while end_dim < ndim and product < var_range:
+                product *= buf_shape[end_dim]
+                end_dim += 1
+
+            if product != var_range:
+                return None
+
+            # Verify coefficient: should equal product(shape[end_dim:ndim])
+            expected_coeff = 1
+            for d in range(end_dim, ndim):
+                expected_coeff *= buf_shape[d]
+            if coeff != expected_coeff:
+                return None
+
+            collapsed_shape.append(var_range)
+            collapsed_vars.append(var)
+            dim_cursor = end_dim
+
+        if dim_cursor != ndim:
+            return None
+
+        # For non-atomic stores, the value just needs reshaping to
+        # the output buffer shape.
+        if mode != "atomic_add":
+            return self._build_full_array_store_expr(out, value, False)
+
+        # atomic_add with N-D decomposition: reshape and use .at[].add()
+        n_collapsed = len(collapsed_shape)
+        self.outputs_need_read.add(out)
+        alias_param = f"{out}_alias"
+
+        if n_collapsed == 1:
+            var = collapsed_vars[0]
+            return [
+                f"{out}[...] = {alias_param}[...].reshape({buf_numel})"
+                f".at[{var}.reshape(-1)].add("
+                f"jnp.asarray({value}).reshape(-1))"
+                f".reshape({out}.shape)"
+            ]
+
+        reshape_str = ", ".join(str(s) for s in collapsed_shape)
+        idx_parts = ", ".join(f"{v}.reshape(-1)" for v in collapsed_vars)
+        return [
+            f"{out}[...] = {alias_param}[...].reshape({reshape_str})"
+            f".at[jnp.ix_({idx_parts})].add("
+            f"jnp.asarray({value}).reshape({reshape_str})"
+            f").reshape({out}.shape)"
+        ]
+
     def _build_store_expr(
         self,
         out: str,
@@ -2505,6 +2663,13 @@ class PallasKernel(SIMDKernel):
             return self._build_full_array_store_expr(out, value, needs_transpose)
 
         if needs_flatten:
+            # Try N-D decomposition before falling back to flatten
+            decomposed = self._try_decompose_store_index(
+                out, name, index, value, mode
+            )
+            if decomposed is not None:
+                return decomposed
+
             self.has_flatten_indexing = True
             # Block variable indexing (e.g., im2col) - use flattened scatter
             scatter_op = "add" if mode == "atomic_add" else "set"
