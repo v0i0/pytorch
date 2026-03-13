@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import logging
 import re
-import warnings
 from typing import Any, Generic, TYPE_CHECKING, TypeVar
 
 
@@ -295,7 +294,7 @@ def _get_override_for_compile_id(
     compile_id: CompileId | None,
     config_str: str,
     create_router: Callable[[str], _GraphRouterBase[T]],
-    label: str,
+    log_msg: str,
 ) -> T | None:
     """
     Get the override value for a given CompileId.
@@ -312,7 +311,7 @@ def _get_override_for_compile_id(
     router = create_router(config_str)
     value = router.get_value_for_graph(graph_id)
     if value is not None:
-        log.info("Overriding %s: %s", label, value)
+        log.info(log_msg, compile_id, graph_id, value)
     return value
 
 
@@ -323,27 +322,9 @@ def _create_backend_router(config_str: str) -> GraphBackendRouter:
 
 
 @functools.lru_cache
-def _create_inductor_config_router(config_str: str) -> GraphConfigRouter:
+def _create_config_router(config_str: str) -> GraphConfigRouter:
     """Create and cache GraphConfigRouter instances based on config string."""
     return GraphConfigRouter(config_str)
-
-
-@functools.lru_cache
-def _create_dynamo_config_router(config_str: str) -> GraphConfigRouter:
-    """Create and cache GraphConfigRouter for dynamo config overrides.
-
-    Warns that dynamo config overrides are keyed by frame ID and some configs
-    can affect graph breaks, which may shift frame IDs.
-    """
-    router = GraphConfigRouter(config_str)
-    if not router.is_empty():
-        warnings.warn(
-            "TORCH_COMPILE_OVERRIDE_DYNAMO_CONFIGS is set. Dynamo config overrides are "
-            "keyed by frame ID. Some dynamo configs can affect graph breaks, "
-            "which may alter the number of frames and shift frame IDs, causing "
-            "overrides to target the wrong graphs.",
-        )
-    return router
 
 
 def get_backend_override_for_compile_id(
@@ -359,7 +340,7 @@ def get_backend_override_for_compile_id(
         compile_id,
         config_str,
         _create_backend_router,
-        "torch.compile backend",
+        "Graph %s (frame_id=%d) overridden to use backend: %s",
     )
 
 
@@ -375,25 +356,8 @@ def get_inductor_config_override_for_compile_id(
     return _get_override_for_compile_id(
         compile_id,
         config_str,
-        _create_inductor_config_router,  # type: ignore[arg-type]
-        "inductor config",
-    )
-
-
-def get_dynamo_config_override_for_compile_id(
-    compile_id: CompileId | None,
-    config_str: str,
-) -> dict[str, Any] | None:
-    """
-    Get the dynamo config override for a given CompileId.
-
-    Returns a dict of config patches to apply, or None if no override applies.
-    """
-    return _get_override_for_compile_id(
-        compile_id,
-        config_str,
-        _create_dynamo_config_router,  # type: ignore[arg-type]
-        "dynamo config",
+        _create_config_router,  # type: ignore[arg-type]
+        "Graph %s (frame_id=%d) overridden with inductor config: %s",
     )
 
 

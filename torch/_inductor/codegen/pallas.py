@@ -2148,6 +2148,92 @@ class PallasKernel(SIMDKernel):
         """
         return f"pallas_permute({load_expr}, {perm})"
 
+    def _try_decompose_modular_index(
+        self, name: str, index: sympy.Expr
+    ) -> str | None:
+        """Decompose a flattened ModularIndexing expression into multi-dim indexing.
+
+        When repeat/roll/reshape produces an index like
+            x0 + 8*ModularIndexing(x1, 1, 4) + 32*ModularIndexing(x2, 1, 2)
+        on buffer shape (2, 4, 8), this emits buf[x2 % 2, x1 % 4, x0] instead
+        of buf[...].flatten()[idx].
+
+        Each term must be coeff * ModularIndexing(expr, 1, mod) or coeff * var,
+        and each coefficient must match exactly one C-contiguous stride of the
+        buffer.
+        """
+        buf_obj = V.graph.get_buffer(name)
+        if buf_obj is None:
+            return None
+
+        buf_size = buf_obj.get_size()
+        ndim = len(buf_size)
+        if ndim == 0:
+            return None
+
+        # Compute C-contiguous strides for the buffer
+        int_dims: list[int | None] = [self._safe_int(s) for s in buf_size]
+        if any(d is None for d in int_dims):
+            return None
+        dims: list[int] = int_dims  # type: ignore[assignment]
+
+        strides: list[int] = [0] * ndim
+        strides[-1] = 1
+        for i in range(ndim - 2, -1, -1):
+            strides[i] = strides[i + 1] * dims[i + 1]
+
+        # Build stride -> dim mapping (each stride must be unique)
+        stride_to_dim: dict[int, int] = {}
+        for dim_idx, s in enumerate(strides):
+            if s in stride_to_dim:
+                return None  # Ambiguous stride mapping
+            stride_to_dim[s] = dim_idx
+
+        # Decompose index into terms
+        terms = index.as_ordered_terms()
+
+        # Match each term to a dimension
+        dim_exprs: dict[int, str] = {}
+        for term in terms:
+            coeff, rest = term.as_coeff_Mul()
+            coeff_int = self._safe_int(coeff)
+            if coeff_int is None:
+                return None
+
+            if isinstance(rest, ModularIndexing):
+                # coeff * ModularIndexing(base, div, mod)
+                if coeff_int not in stride_to_dim:
+                    return None
+                dim_idx = stride_to_dim[coeff_int]
+                if dim_idx in dim_exprs:
+                    return None  # Dimension already assigned
+                dim_exprs[dim_idx] = self.kexpr(rest)
+            elif rest.is_symbol:
+                # coeff * var (plain variable, no modular wrapping)
+                if coeff_int not in stride_to_dim:
+                    return None
+                dim_idx = stride_to_dim[coeff_int]
+                if dim_idx in dim_exprs:
+                    return None
+                dim_exprs[dim_idx] = self.kexpr(rest)
+            elif rest == sympy.S.One:
+                # Constant offset - not supported in this decomposition
+                return None
+            else:
+                return None
+
+        # Fill in size-1 dimensions that have no matching term
+        for i in range(ndim):
+            if i not in dim_exprs:
+                if dims[i] == 1:
+                    dim_exprs[i] = "0"
+                else:
+                    return None
+
+        # Build the multi-dim index string in dimension order
+        parts = [dim_exprs[i] for i in range(ndim)]
+        return ", ".join(parts)
+
     def _build_load_expr(
         self,
         buf: str,
@@ -2160,6 +2246,12 @@ class PallasKernel(SIMDKernel):
         Build the load expression based on indexing mode.
         """
         if needs_flatten:
+            # Try to decompose ModularIndexing into multi-dim indexing first
+            if index.has(ModularIndexing):
+                decomposed = self._try_decompose_modular_index(name, index)
+                if decomposed is not None:
+                    return f"{buf}[{decomposed}]"
+
             self.has_flatten_indexing = True
             self.flatten_indexed_buffers.add(name)
             # Flatten then index for non-contiguous access (gather operation)

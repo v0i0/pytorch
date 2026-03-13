@@ -335,11 +335,15 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
             exit_stack.enter_context(
                 torch.fx._symbolic_trace._maybe_revert_all_patches()
             )
+            exit_stack.enter_context(torch_function_mode_stack_state_mgr)
             reset_user_object_tracking()
             try:
                 return fn(*args, **kwargs)
             finally:
                 cleanup.close()
+                assert torch._C._len_torch_function_stack() == 0, (
+                    "Torch function mode stack state changed while dynamo tracing, please report a bug"
+                )
                 exit_stack.close()
                 torch._C._set_grad_enabled(prior_grad_mode)
                 torch.autograd.grad_mode._enter_inference_mode(prior_inference_mode)
@@ -1365,8 +1369,8 @@ def compile_frame(  # type: ignore[return]
     def transform(
         instructions: list[Instruction], code_options: dict[str, object]
     ) -> DynamoTracerOutput:
-        tf_mode_stack: list[torch.overrides.TorchFunctionMode] = list(
-            torch_function_mode_stack_state_mgr.stack
+        tf_mode_stack: list[torch.overrides.TorchFunctionMode] = (
+            torch.overrides._get_current_function_mode_stack()
         )
         tracer_output = trace_frame(
             code,
@@ -1488,12 +1492,7 @@ def _compile(
                 )
             )
             stack.enter_context(CompileTimeInstructionCounter.record())
-            stack.enter_context(torch_function_mode_stack_state_mgr)
-            result = _compile_inner(code, one_graph, hooks)
-            assert torch._C._len_torch_function_stack() == 0, (
-                "Torch function mode stack state changed while dynamo tracing, please report a bug"
-            )
-            return result
+            return _compile_inner(code, one_graph, hooks)
 
         return (
             ConvertFrameReturn(),
@@ -1537,32 +1536,22 @@ def _compile(
                 payload_fn=lambda: dis.Bytecode(code).dis(),
             )
         out_code = None
-        from .graph_id_filter import get_dynamo_config_override_for_compile_id
-
-        dynamo_config_override = get_dynamo_config_override_for_compile_id(
-            compile_id, config.debug_dynamo_config_override
-        )
         try:
-            with (
-                config.patch(dynamo_config_override)
-                if dynamo_config_override
-                else contextlib.nullcontext()
-            ):
-                dynamo_output = compile_frame(
-                    code,
-                    globals,
-                    locals,
-                    builtins,
-                    closure,
-                    compiler_fn,
-                    one_graph,
-                    restart_reasons,
-                    export=export,
-                    export_constraints=export_constraints,
-                    frame_state=frame_state,
-                    distributed_state=distributed_state,
-                    package=package,
-                )
+            dynamo_output = compile_frame(
+                code,
+                globals,
+                locals,
+                builtins,
+                closure,
+                compiler_fn,
+                one_graph,
+                restart_reasons,
+                export=export,
+                export_constraints=export_constraints,
+                frame_state=frame_state,
+                distributed_state=distributed_state,
+                package=package,
+            )
         except exc.SkipFrame as e:
             if one_graph:
                 log.debug("No graph captured with export/fullgraph=True")
@@ -1665,16 +1654,7 @@ def _compile(
         assert output.guards is not None
         CleanupManager.instance[out_code] = output.cleanups
         nonlocal cache_entry
-        # Temporarily restore the mode stack so guard expressions that
-        # reference modes can evaluate.  DisableTorchFunction prevents
-        # __torch_function__ dispatch during guard construction so modes
-        # with mutable state aren't triggered.
-        build_guards_ctx = contextlib.ExitStack()
-        if torch_function_mode_stack_state_mgr.stack:
-            build_guards_ctx.enter_context(
-                torch_function_mode_stack_state_mgr.temp_restore_stack()
-            )
-        with dynamo_timed("build_guards", log_pt2_compile_event=True), build_guards_ctx:
+        with dynamo_timed("build_guards", log_pt2_compile_event=True):
             check_fn = dynamo_output.build_guards(
                 code,
                 hooks=hooks,

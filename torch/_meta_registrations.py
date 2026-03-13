@@ -255,9 +255,14 @@ def _exec_fft(out, self, out_sizes, dim, *, forward):
     for d in dim:
         is_transformed_dim[d] = True
 
-    # std::partition + std::copy(dim.begin(), dim.end(), batch_end)
-    left = [d for d in dim_permute if not is_transformed_dim[d]]
-    dim_permute = left + list(dim)
+    # std::partition
+    left, right = [], []
+    for d in dim_permute:
+        if not is_transformed_dim[d]:
+            left.append(d)
+        else:
+            right.append(d)
+    dim_permute = left + right
     batch_end = len(left)
 
     self_strides = self.stride()
@@ -295,9 +300,8 @@ def _exec_fft(out, self, out_sizes, dim, *, forward):
 def _sort_dims(self: Tensor, dim: list[int], exclude_last: bool = False):
     sorted_dims = list(dim)
     self_strides = self.stride()
-    end = len(sorted_dims) - int(exclude_last)
-    sorted_dims[:end] = sorted(
-        sorted_dims[:end], key=lambda i: self_strides[i], reverse=True
+    sorted_dims[: len(sorted_dims) - int(exclude_last)].sort(
+        key=lambda i: self_strides[i]
     )
     return sorted_dims
 
@@ -310,9 +314,6 @@ def meta_fft_c2c(self, dim, normalization, forward):
     torch._check(self.dtype.is_complex)
     if not dim:
         return self.clone()
-
-    if device_hint(self) == "cpu" and not torch.backends.mkl.is_available():
-        return self.new_empty(self.size())
 
     sorted_dims = _sort_dims(self, dim)
     out = self.new_empty(self.size())
@@ -383,14 +384,6 @@ def meta_fft_r2c(self, dim, normalization, onesided):
                 output = working_tensor
 
         return output
-
-    elif torch.backends.mkl.is_available():
-        # _fft_r2c_mkl in aten/src/ATen/native/mkl/SpectralOps.cpp
-        sorted_dims = _sort_dims(self, dim, exclude_last=True)
-        output = self.new_empty(
-            out_sizes, dtype=utils.corresponding_complex_dtype(self.dtype)
-        )
-        return _exec_fft(output, self, out_sizes, sorted_dims, forward=True)
 
     else:
         return self.new_empty(
@@ -495,8 +488,7 @@ def meta_fft_c2r(self: Tensor, dim: list[int], normalization: int, lastdim: int)
                 temp = self.clone(memory_format=torch.contiguous_format)
             return _exec_fft(output, temp, out_sizes, [dim[-1]], forward=False)
 
-    elif torch.backends.mkl.is_available():
-        # _fft_c2r_mkl in aten/src/ATen/native/mkl/SpectralOps.cpp
+    else:
         input = self
         if len(dim) > 1:
             c2c_dims = dim[:-1]
@@ -507,11 +499,6 @@ def meta_fft_c2r(self: Tensor, dim: list[int], normalization: int, lastdim: int)
         out_sizes[dim[-1]] = lastdim
         out = self.new_empty(out_sizes, dtype=toRealValueType(self.dtype))
         return _exec_fft(out, input, out_sizes, dim, forward=False)
-
-    else:
-        out_sizes = list(self.size())
-        out_sizes[dim[-1]] = lastdim
-        return self.new_empty(out_sizes, dtype=toRealValueType(self.dtype))
 
 
 @register_meta(aten.copy_.default)
@@ -3787,8 +3774,8 @@ def meta__int_mm(a, b):
     torch._check(a.dim() == 2, lambda: "a must be a 2D tensor")
     torch._check(b.dim() == 2, lambda: "b must be a 2D tensor")
     torch._check(
-        a.dtype in [torch.int8, torch.uint8],
-        lambda: f"expected self to be int8 or uint8, got {a.dtype}",
+        a.dtype is torch.int8,
+        lambda: f"expected self to be int8, got {a.dtype}",
     )
     torch._check(
         b.dtype is torch.int8,
@@ -6352,7 +6339,6 @@ def meta__flash_attention_forward(
     window_size_right: int | None = None,
     seqused_k: Tensor | None = None,
     alibi_slopes: Tensor | None = None,
-    block_table: Tensor | None = None,
 ):
     # NB: there are two underlying paths:
     # 1. normal dense path; expect 4D inputs of shape (batch_size, seqlen, num_heads, head_dim)
@@ -6410,47 +6396,6 @@ def meta__flash_attention_forward(
         offset,
         debug_mask,
     )
-
-
-@register_meta([aten._flash_attention_forward_no_dropout_inplace.default])
-def meta__flash_attention_forward_no_dropout_inplace(
-    out: Tensor,
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    cum_seq_q: Tensor | None,
-    cum_seq_k: Tensor | None,
-    max_q: int,
-    max_k: int,
-    dropout_p: float,
-    is_causal: bool,
-    return_debug_mask: bool,
-    scale: float | None = None,
-    window_size_left: int | None = None,
-    window_size_right: int | None = None,
-    seqused_k: Tensor | None = None,
-    alibi_slopes: Tensor | None = None,
-    block_table: Tensor | None = None,
-):
-    _, logsumexp, _, _, _ = meta__flash_attention_forward(
-        query,
-        key,
-        value,
-        cum_seq_q,
-        cum_seq_k,
-        max_q,
-        max_k,
-        dropout_p,
-        is_causal,
-        return_debug_mask,
-        scale,
-        window_size_left,
-        window_size_right,
-        seqused_k,
-        alibi_slopes,
-        block_table,
-    )
-    return logsumexp
 
 
 @register_meta([aten._flash_attention_forward.quantized])
