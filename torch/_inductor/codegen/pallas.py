@@ -2063,6 +2063,77 @@ class PallasKernel(SIMDKernel):
 
         return index_str, needs_flatten
 
+    def _try_stride_slice(
+        self,
+        name: str,
+        index: sympy.Expr,
+        index_str: str,
+        needs_flatten: bool,
+    ) -> tuple[str, bool]:
+        """Try to emit stride slice notation for 1D strided access.
+
+        For a 1D buffer with index ``stride * var + offset``, emit
+        ``buf[offset::stride]`` instead of ``buf[...].flatten()[idx]``.
+        Works even when the buffer size is not divisible by stride.
+        """
+        if not needs_flatten:
+            return index_str, needs_flatten
+
+        # GPU: slice notation triggers gather which is not supported
+        if self.is_gpu:
+            return index_str, needs_flatten
+
+        buf_obj = V.graph.get_buffer(name)
+        if buf_obj is None:
+            return index_str, needs_flatten
+
+        buf_size = buf_obj.get_size()
+        if len(buf_size) != 1:
+            return index_str, needs_flatten
+
+        used_vars = self._get_used_iter_vars(index)
+        if len(used_vars) != 1:
+            return index_str, needs_flatten
+
+        var = next(iter(used_vars))
+        var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(index, var)
+        stride = self._safe_int(
+            BlockPatternMatcher.match_affine_block_expr(var_expr, var)
+        )
+        if stride is None or stride < 1:
+            return index_str, needs_flatten
+
+        offset = V.graph.sizevars.simplify(index - var_expr)
+        try:
+            offset_val = int(offset)
+        except (TypeError, ValueError):
+            return index_str, needs_flatten
+
+        if offset_val < 0:
+            return index_str, needs_flatten
+
+        buf_len = self._safe_int(buf_size[0])
+        if buf_len is None:
+            return index_str, needs_flatten
+
+        # Verify iteration variable range matches expected slice length
+        entry = self.range_tree_nodes.get(var)
+        if entry is None:
+            return index_str, needs_flatten
+        var_length = self._safe_int(entry.length)
+        if var_length is None:
+            return index_str, needs_flatten
+        expected_len = (buf_len - offset_val + stride - 1) // stride
+        if var_length != expected_len:
+            return index_str, needs_flatten
+
+        if stride == 1 and offset_val == 0:
+            return "...", False
+        elif offset_val == 0:
+            return f"::{stride}", False
+        else:
+            return f"{offset_val}::{stride}", False
+
     def _try_multidim_slice(
         self,
         name: str,
@@ -2650,6 +2721,11 @@ class PallasKernel(SIMDKernel):
         else:
             # Adjust index for buffer shape (scalar, multi-dim, etc.)
             index_str, needs_flatten = self._adjust_index_for_buffer_shape(
+                name, index, index_str, needs_flatten
+            )
+
+            # Try 1D stride slice before multi-dim or flatten
+            index_str, needs_flatten = self._try_stride_slice(
                 name, index, index_str, needs_flatten
             )
 
