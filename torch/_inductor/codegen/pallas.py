@@ -2148,6 +2148,119 @@ class PallasKernel(SIMDKernel):
         """
         return f"pallas_permute({load_expr}, {perm})"
 
+    def _try_multidim_index(
+        self,
+        buf: str,
+        name: str,
+        index: sympy.Expr,
+    ) -> str | None:
+        """Try to decompose a flat index into N-D indexing for a multi-dim buffer.
+
+        Given flat index like ``x0 + 16*x1`` and buffer shape ``(8, 16)``
+        with C-contiguous strides ``[16, 1]``:
+          - x1: coefficient 16 matches stride[0] -> dim 0
+          - x0: coefficient 1 matches stride[1] -> dim 1
+          - Emit: ``buf[x1, x0]``
+
+        Returns the load expression string, or None if decomposition fails.
+        """
+        if self._has_indirect_vars(index) or index.has(ModularIndexing):
+            return None
+
+        info = self._get_buffer_info(name)
+        if info is None:
+            return None
+        _, buf_size, _, _, _ = info
+
+        buf_shape = [self._safe_int(s) for s in buf_size]
+        if any(s is None or s <= 0 for s in buf_shape):
+            return None
+        ndim = len(buf_shape)
+        if ndim < 2:
+            return None
+
+        c_strides = self._c_contiguous_strides(buf_shape)
+
+        used_vars = self._get_used_iter_vars(index)
+        if not used_vars:
+            return None
+
+        # Map each variable to a buffer dimension via its coefficient
+        var_to_dim: dict[sympy.Symbol, int] = {}
+        remaining = V.graph.sizevars.simplify(index)
+        for var in used_vars:
+            var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(remaining, var)
+            coeff = BlockPatternMatcher.match_affine_block_expr(var_expr, var)
+            if coeff is None:
+                return None
+            coeff_int = self._safe_int(coeff)
+            if coeff_int is None or coeff_int <= 0:
+                return None
+
+            # Find which buffer dim this coefficient matches
+            dim = None
+            for d in range(ndim):
+                if c_strides[d] == coeff_int:
+                    if d not in var_to_dim.values():
+                        dim = d
+                        break
+            if dim is None:
+                return None
+
+            var_to_dim[var] = dim
+            remaining = V.graph.sizevars.simplify(remaining - var_expr)
+
+        # Check that each variable maps to a distinct dimension
+        if len(set(var_to_dim.values())) != len(var_to_dim):
+            return None
+
+        # Remaining is the constant offset
+        offset_val = self._safe_int(remaining)
+        if offset_val is None or offset_val < 0:
+            return None
+
+        # Distribute offset across dimensions using C-contiguous strides
+        dim_offsets: dict[int, int] = {}
+        rem = offset_val
+        for d in range(ndim):
+            if c_strides[d] > 0:
+                dim_offsets[d] = rem // c_strides[d]
+                rem = rem % c_strides[d]
+        if rem != 0:
+            return None
+
+        # Validate variable ranges match buffer dimensions
+        for var, dim in var_to_dim.items():
+            if var not in self.range_tree_nodes:
+                return None
+            var_range = self._safe_int(self.range_tree_nodes[var].length)
+            dim_offset = dim_offsets.get(dim, 0)
+            if var_range is None or var_range + dim_offset > buf_shape[dim]:
+                return None
+
+        # Build N-D index parts
+        # Invert var_to_dim: dim -> var
+        dim_to_var: dict[int, sympy.Symbol] = {d: v for v, d in var_to_dim.items()}
+
+        # Mixing array indices with : slices triggers JAX fancy indexing
+        # semantics which broadcasts arrays together instead of doing
+        # independent per-dimension indexing.  Require every dimension
+        # to have exactly one mapped variable.
+        if len(dim_to_var) != ndim:
+            return None
+
+        parts: list[str] = []
+        for d in range(ndim):
+            var = dim_to_var[d]
+            var_name = str(var)
+            offset_d = dim_offsets.get(d, 0)
+            if offset_d != 0:
+                parts.append(f"{offset_d} + {var_name}")
+            else:
+                parts.append(var_name)
+
+        return f"{buf}[{', '.join(parts)}]"
+
     def _build_load_expr(
         self,
         buf: str,
@@ -2160,6 +2273,12 @@ class PallasKernel(SIMDKernel):
         Build the load expression based on indexing mode.
         """
         if needs_flatten:
+            # Try N-D indexing when the flat index is a linear combination
+            # of iteration variables whose coefficients match C-contiguous strides.
+            multidim_expr = self._try_multidim_index(buf, name, index)
+            if multidim_expr is not None:
+                return multidim_expr
+
             self.has_flatten_indexing = True
             self.flatten_indexed_buffers.add(name)
             # Flatten then index for non-contiguous access (gather operation)
