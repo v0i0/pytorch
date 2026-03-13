@@ -2160,12 +2160,8 @@ class PallasKernel(SIMDKernel):
         Build the load expression based on indexing mode.
         """
         if needs_flatten:
-            self.has_flatten_indexing = True
-            self.flatten_indexed_buffers.add(name)
-            # Flatten then index for non-contiguous access (gather operation)
-            has_minmax = index.has(sympy.Min) or index.has(sympy.Max)
-            idx = f"({index_str}).astype(jnp.int64)" if has_minmax else index_str
-            return f"{buf}[...].flatten()[{idx}]"
+            from torch._inductor.exc import Unsupported
+            raise Unsupported(f"Pallas: flatten load removed, index={index_str} buf={name}")
         else:
             # Direct indexing for contiguous access
             load_expr = f"{buf}[{index_str}]"
@@ -2505,13 +2501,8 @@ class PallasKernel(SIMDKernel):
             return self._build_full_array_store_expr(out, value, needs_transpose)
 
         if needs_flatten:
-            self.has_flatten_indexing = True
-            # Block variable indexing (e.g., im2col) - use flattened scatter
-            scatter_op = "add" if mode == "atomic_add" else "set"
-            return [
-                f"{out}[...] = {out}[...].flatten().at[({index_str}).flatten()].{scatter_op}("
-                f"jnp.asarray({value}).flatten()).reshape({out}.shape)"
-            ]
+            from torch._inductor.exc import Unsupported
+            raise Unsupported(f"Pallas: flatten store removed, index={index_str}")
 
         # Direct indexed assignment
         has_indirect = self._has_indirect_vars(index)
@@ -2534,10 +2525,8 @@ class PallasKernel(SIMDKernel):
                 # For atomic_add, mark output as needing to be readable (for aliasing)
                 self.outputs_need_read.add(out)
                 alias_param = f"{out}_alias"
-                lines.append(
-                    f"{out}[...] = {alias_param}[...].flatten().at[({index_str}).flatten()].{scatter_op}("
-                    f"{value_expr}.flatten()).reshape({out}.shape)"
-                )
+                from torch._inductor.exc import Unsupported
+                raise Unsupported(f"Pallas: flatten indirect store removed, index={index_str}")
             else:
                 lines.append(f"{out}[{index_str}] = {value_expr}")
             return lines

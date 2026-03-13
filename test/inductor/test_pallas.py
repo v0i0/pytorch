@@ -746,6 +746,7 @@ class PallasTestsMixin:
     @skip_if_cuda(
         reason="Multi-dimensional gather not supported on Pallas Mosaic (CUDA) backend"
     )
+    @skip_if_cpu
     def test_complex_indexing_2d(self):
         """Test complex indexing on 2D tensors with integer array indexing."""
 
@@ -1196,6 +1197,7 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     @skip_if_tpu
+    @skip_if_cpu
     def test_rope(self):
         """Test Rotary Position Embedding with slice + cat.
 
@@ -1264,6 +1266,7 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     @skip_if_tpu  # store uses flatten+scatter, unsupported on Mosaic
+    @skip_if_cpu
     def test_strided_multi_dim(self):
         """Test strided access on multiple dimensions simultaneously."""
 
@@ -1280,6 +1283,7 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     @skip_if_tpu  # falls back to flatten+gather, unsupported on Mosaic
+    @skip_if_cpu
     def test_strided_non_divisible(self):
         """Test strided access where dim is not divisible by stride.
 
@@ -1314,6 +1318,7 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     @skip_if_tpu  # store uses scatter, unsupported on Mosaic
+    @skip_if_cpu
     def test_strided_large_offset_2d(self):
         """Test 2D strided access where offset >= stride on last dim."""
 
