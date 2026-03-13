@@ -2138,6 +2138,132 @@ class PallasKernel(SIMDKernel):
             slice_str = f"{prefix}{offset_val}::{stride}"
         return slice_str, False
 
+    def _try_offset_slice(
+        self,
+        name: str,
+        index: sympy.Expr,
+        index_str: str,
+        needs_flatten: bool,
+    ) -> tuple[str, bool]:
+        """Try to convert contiguous-with-offset access into multi-dim slicing.
+
+        For buffer shape (d0, d1, ...) with C-contiguous strides and an index
+        expression like ``offset + c0*var0 + c1*var1 + ...`` where each
+        coefficient ci equals the C-contiguous stride for exactly one
+        dimension, decompose the constant offset across dimensions and emit
+        ``buf[off0:, off1:, ...]`` instead of ``buf[...].flatten()[idx]``.
+        """
+        if not needs_flatten:
+            return index_str, needs_flatten
+
+        if self._has_indirect_vars(index) or index.has(ModularIndexing):
+            return index_str, needs_flatten
+
+        buf_obj = V.graph.get_buffer(name)
+        if buf_obj is None:
+            return index_str, needs_flatten
+
+        buf_size = buf_obj.get_size()
+        ndim = len(buf_size)
+        if ndim < 2:
+            return index_str, needs_flatten
+
+        buf_shape = [self._safe_int(s) for s in buf_size]
+        if any(s is None or s <= 0 for s in buf_shape):
+            return index_str, needs_flatten
+
+        c_strides = self._c_contiguous_strides(buf_shape)
+
+        used_vars = self._get_used_iter_vars(index)
+        if len(used_vars) != ndim:
+            return index_str, needs_flatten
+
+        # Extract per-variable coefficients and match to buffer dims.
+        remaining = V.graph.sizevars.simplify(index)
+        dim_to_var: dict[int, sympy.Symbol] = {}
+        for var in used_vars:
+            var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(remaining, var)
+            coeff = BlockPatternMatcher.match_affine_block_expr(var_expr, var)
+            if coeff is None:
+                return index_str, needs_flatten
+            coeff_int = self._safe_int(coeff)
+            if coeff_int is None or coeff_int <= 0:
+                return index_str, needs_flatten
+
+            # Find matching dim: coeff must exactly equal a C-contiguous stride
+            matched_dim = None
+            for d in range(ndim):
+                if c_strides[d] == coeff_int and d not in dim_to_var:
+                    matched_dim = d
+                    break
+            if matched_dim is None:
+                return index_str, needs_flatten
+
+            dim_to_var[matched_dim] = var
+            remaining = V.graph.sizevars.simplify(remaining - var_expr)
+
+        # The remaining expression should be the constant offset
+        offset_val = self._safe_int(remaining)
+        if offset_val is None:
+            return index_str, needs_flatten
+
+        # Handle negative offsets: the offset must still land within
+        # the buffer when combined with the iteration variables.
+        # Negative offsets are fine as long as the total access range
+        # is valid.  Distribute using Python divmod (floors toward
+        # negative infinity), which produces a non-negative remainder.
+        per_dim_offset: list[int] = [0] * ndim
+        rem = offset_val
+        for d in range(ndim):
+            if c_strides[d] > 0:
+                per_dim_offset[d], rem = divmod(rem, c_strides[d])
+        if rem != 0:
+            return index_str, needs_flatten
+
+        # Validate: for each dim that has a variable, the variable
+        # range plus offset must fit within the dim size.
+        for d in range(ndim):
+            off_d = per_dim_offset[d]
+            if d in dim_to_var:
+                var = dim_to_var[d]
+                entry = self.range_tree_nodes.get(var)
+                if entry is None:
+                    return index_str, needs_flatten
+                var_len = self._safe_int(entry.length)
+                if var_len is None:
+                    return index_str, needs_flatten
+                if off_d + var_len > buf_shape[d] or off_d + var_len <= 0:
+                    return index_str, needs_flatten
+            else:
+                # Dim not covered by any variable; offset must be
+                # a valid index and the dim must be size 1 (broadcast) or
+                # the caller must be accessing a single element in this dim.
+                if off_d < 0 or off_d >= buf_shape[d]:
+                    return index_str, needs_flatten
+
+        # Build slice notation.  Dims with a variable get a slice
+        # (possibly with explicit end), dims without get a static index.
+        parts: list[str] = []
+        for d in range(ndim):
+            off_d = per_dim_offset[d]
+            if d in dim_to_var:
+                var = dim_to_var[d]
+                entry = self.range_tree_nodes[var]
+                var_len = self._safe_int(entry.length)
+                end_d = off_d + var_len  # type: ignore[operator]
+                if off_d == 0 and end_d == buf_shape[d]:
+                    parts.append(":")
+                elif end_d == buf_shape[d]:
+                    parts.append(f"{off_d}:")
+                elif off_d == 0:
+                    parts.append(f":{end_d}")
+                else:
+                    parts.append(f"{off_d}:{end_d}")
+            else:
+                parts.append(str(off_d))
+        slice_str = ", ".join(parts)
+        return slice_str, False
+
     @staticmethod
     def _gather_permute_expr(load_expr: str, perm: tuple[int, ...]) -> str:
         """Generate gather-based permutation instead of jnp.permute_dims.
@@ -2655,6 +2781,11 @@ class PallasKernel(SIMDKernel):
 
             # Try to emit multi-dim slice instead of flatten + gather
             index_str, needs_flatten = self._try_multidim_slice(
+                name, index, index_str, needs_flatten
+            )
+
+            # Try to decompose contiguous access with constant offset
+            index_str, needs_flatten = self._try_offset_slice(
                 name, index, index_str, needs_flatten
             )
 
