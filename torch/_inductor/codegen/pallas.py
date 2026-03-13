@@ -2148,6 +2148,178 @@ class PallasKernel(SIMDKernel):
         """
         return f"pallas_permute({load_expr}, {perm})"
 
+    def _try_nd_index_decomposition(
+        self, name: str, index: sympy.Expr, buf: str
+    ) -> tuple[str, list[int]] | None:
+        """Decompose a flat linear index into N-D buffer slicing.
+
+        Given ``offset + c0*x0 + c1*x1 + ...`` and the buffer's shape,
+        map each variable to a buffer dimension by matching its absolute
+        coefficient against C-contiguous strides. Supports:
+        - Offsets (narrow / sub-tensor views)
+        - Negative coefficients (flip)
+        - Non-unit per-dim strides (pooling)
+        - Fewer variables than dims (collapsed or reduced dimensions)
+
+        Returns ``(load_expr, flip_axes)`` or ``None``.
+        """
+        if self._has_indirect_vars(index) or index.has(ModularIndexing):
+            return None
+
+        info = self._get_buffer_info(name)
+        if info is None:
+            return None
+        _, buf_size, _, _, _ = info
+
+        buf_shape = [self._safe_int(s) for s in buf_size]
+        if any(s is None or s <= 0 for s in buf_shape):
+            return None
+        buf_shape_int: list[int] = cast(list[int], buf_shape)
+        ndim = len(buf_shape_int)
+        if ndim == 0:
+            return None
+
+        c_strides = self._c_contiguous_strides(buf_shape_int)
+
+        used_vars = self._get_used_iter_vars(index)
+        if not used_vars:
+            return None
+
+        # Extract coefficient and range for each variable.
+        remaining = V.graph.sizevars.simplify(index)
+        # Per-dim: (per_dim_stride, effective_range, is_flip) or None
+        dim_info: list[tuple[int, int, bool] | None] = [None] * ndim
+        # Dims that are part of a collapsed group get marked True
+        collapsed: list[bool] = [False] * ndim
+        flip_axes: list[int] = []
+
+        for var in used_vars:
+            var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(remaining, var)
+            coeff = BlockPatternMatcher.match_affine_block_expr(var_expr, var)
+            if coeff is None:
+                return None
+            coeff_int = self._safe_int(coeff)
+            if coeff_int is None or coeff_int == 0:
+                return None
+
+            is_flip = coeff_int < 0
+            abs_coeff = abs(coeff_int)
+
+            if var not in self.range_tree_nodes:
+                return None
+            var_range = self._safe_int(self.range_tree_nodes[var].length)
+            if var_range is None or var_range <= 0:
+                return None
+
+            # Find which buffer dim this variable enters at.
+            # abs_coeff == c_strides[d] * per_dim_stride for some dim d.
+            entry_dim = None
+            per_dim_stride = 1
+            for d in range(ndim):
+                if c_strides[d] == 0 or dim_info[d] is not None:
+                    continue
+                if abs_coeff % c_strides[d] == 0:
+                    pds = abs_coeff // c_strides[d]
+                    if pds >= 1 and buf_shape_int[d] >= pds:
+                        entry_dim = d
+                        per_dim_stride = pds
+                        break
+
+            if entry_dim is None:
+                return None
+
+            # Check if variable fits in this single dim
+            effective_dim_size = buf_shape_int[entry_dim] // per_dim_stride
+            if var_range <= effective_dim_size:
+                dim_info[entry_dim] = (per_dim_stride, var_range, is_flip)
+            else:
+                # Variable spans multiple consecutive dims ending at entry_dim.
+                # Walk outward from entry_dim toward dim 0. The variable
+                # iterates through entry_dim first (innermost of the group),
+                # then wraps to entry_dim-1, etc.
+                if per_dim_stride != 1:
+                    return None  # collapsed + strided not supported
+                span_size = buf_shape_int[entry_dim]
+                group_start = entry_dim
+                while group_start > 0 and span_size < var_range:
+                    group_start -= 1
+                    if dim_info[group_start] is not None:
+                        return None
+                    span_size *= buf_shape_int[group_start]
+                if var_range > span_size:
+                    return None
+                # Mark all dims in the collapsed group
+                for j in range(group_start, entry_dim + 1):
+                    collapsed[j] = True
+                    dim_info[j] = (1, buf_shape_int[j], False)
+                # Override the outermost dim of the group with the var's range.
+                # If var_range < span_size, the outermost dim is partially used.
+                if var_range < span_size:
+                    partial = var_range
+                    for j in range(group_start + 1, entry_dim + 1):
+                        partial = (partial + buf_shape_int[j] - 1) // buf_shape_int[j]
+                    dim_info[group_start] = (1, partial, is_flip)
+                else:
+                    dim_info[group_start] = (1, buf_shape_int[group_start], is_flip)
+
+            if is_flip:
+                flip_axes.append(entry_dim)
+
+            remaining = V.graph.sizevars.simplify(remaining - var_expr)
+
+        # Remaining is the constant offset
+        offset_val = self._safe_int(remaining)
+        if offset_val is None:
+            return None
+
+        # For flip dims, adjust offset: 5+(-1)*x with range R means
+        # positions R-1, R-2, ..., 0, so base offset = 5 - (R-1).
+        for d in flip_axes:
+            info_d = dim_info[d]
+            if info_d is None:
+                return None
+            pds, var_range, _ = info_d
+            # The coefficient abs value for this dim
+            offset_val -= (var_range - 1) * c_strides[d] * pds
+
+        if offset_val < 0:
+            return None
+
+        # Distribute offset across dims using divmod with C-strides
+        per_dim_offset: list[int] = [0] * ndim
+        rem = offset_val
+        for d in range(ndim):
+            if c_strides[d] > 0:
+                per_dim_offset[d] = rem // c_strides[d]
+                rem = rem % c_strides[d]
+        if rem != 0:
+            return None
+
+        # Build the N-D slice expression
+        parts: list[str] = []
+        for d in range(ndim):
+            off_d = per_dim_offset[d]
+            info_d = dim_info[d]
+            if info_d is not None:
+                pds, var_range, _is_flip = info_d
+                end = off_d + var_range * pds
+                if end > buf_shape_int[d]:
+                    return None
+                if pds > 1:
+                    parts.append(f"{off_d}:{end}:{pds}")
+                elif off_d == 0 and end == buf_shape_int[d]:
+                    parts.append(":")
+                else:
+                    parts.append(f"{off_d}:{end}")
+            else:
+                # No variable mapped - constant index
+                if off_d >= buf_shape_int[d]:
+                    return None
+                parts.append(str(off_d))
+
+        load_expr = f"{buf}[{', '.join(parts)}]"
+        return load_expr, flip_axes
+
     def _build_load_expr(
         self,
         buf: str,
@@ -2160,7 +2332,6 @@ class PallasKernel(SIMDKernel):
         Build the load expression based on indexing mode.
         """
         if needs_flatten:
-            from torch._inductor.exc import Unsupported
             raise Unsupported(f"Pallas: flatten load removed, index={index_str} buf={name}")
         else:
             # Direct indexing for contiguous access
@@ -2501,7 +2672,6 @@ class PallasKernel(SIMDKernel):
             return self._build_full_array_store_expr(out, value, needs_transpose)
 
         if needs_flatten:
-            from torch._inductor.exc import Unsupported
             raise Unsupported(f"Pallas: flatten store removed, index={index_str}")
 
         # Direct indexed assignment
@@ -2525,7 +2695,6 @@ class PallasKernel(SIMDKernel):
                 # For atomic_add, mark output as needing to be readable (for aliasing)
                 self.outputs_need_read.add(out)
                 alias_param = f"{out}_alias"
-                from torch._inductor.exc import Unsupported
                 raise Unsupported(f"Pallas: flatten indirect store removed, index={index_str}")
             else:
                 lines.append(f"{out}[{index_str}] = {value_expr}")
@@ -2647,10 +2816,22 @@ class PallasKernel(SIMDKernel):
                 name, index, index_str, needs_flatten
             )
 
-            # Build the load expression
-            load_expr = self._build_load_expr(
-                buf, name, index, index_str, needs_flatten
-            )
+            # Try N-D index decomposition before giving up on flatten
+            nd_result = None
+            if needs_flatten:
+                nd_result = self._try_nd_index_decomposition(name, index, buf)
+                if nd_result is not None:
+                    load_expr, flip_axes = nd_result
+                    for axis in flip_axes:
+                        load_expr = f"jnp.flip({load_expr}, axis={axis})"
+                    needs_flatten = False
+                    index_str = "..."
+
+            # Build the load expression (raises Unsupported if still flatten)
+            if nd_result is None:
+                load_expr = self._build_load_expr(
+                    buf, name, index, index_str, needs_flatten
+                )
 
         # Handle intermediate buffer squeezing for correct broadcasting
         if not needs_flatten and index_str == "...":
@@ -2905,6 +3086,26 @@ class PallasKernel(SIMDKernel):
                     index_str, needs_flatten = self._check_im2col_pattern(
                         index, index_str, needs_flatten
                     )
+
+                    # If store needs flatten, check if it's actually a contiguous
+                    # full-buffer write (all elements covered exactly once).
+                    # This fixes false im2col detection for ND-decomposed loads
+                    # where load coefficients don't match buffer strides exactly
+                    # but still produce valid sliced access.
+                    if needs_flatten:
+                        output_numel, _ = self._compute_output_numel_from_index(
+                            index
+                        )
+                        buf_obj = V.graph.get_buffer(name)
+                        if buf_obj is not None:
+                            buf_numel = 1
+                            for s in buf_obj.get_size():
+                                d = self._safe_int(s)
+                                if d is not None:
+                                    buf_numel *= d
+                            if output_numel == buf_numel:
+                                index_str = "..."
+                                needs_flatten = False
 
                     # Build the store expression
                     store_lines = self._build_store_expr(
