@@ -1624,8 +1624,11 @@ class PallasKernel(SIMDKernel):
             # If index_str is an actual expression (not "..." or a slice pattern),
             # we need flattened access because it uses block variables
             if not needs_flatten and index_str != "...":
-                # Check if it's a simple slice pattern (::N or M::N)
-                if not ("::" in index_str or index_str.lstrip("-").isdigit()):
+                # Check if it's a simple slice pattern, digit, or bare variable name
+                is_slice = "::" in index_str
+                is_digit = index_str.lstrip("-").isdigit()
+                is_bare_var = index_str in {str(v) for v in self._get_iter_vars()}
+                if not (is_slice or is_digit or is_bare_var):
                     needs_flatten = True
             return index_str, needs_flatten
 
@@ -2160,7 +2163,6 @@ class PallasKernel(SIMDKernel):
         Build the load expression based on indexing mode.
         """
         if needs_flatten:
-            from torch._inductor.exc import Unsupported
             raise Unsupported(f"Pallas: flatten load removed, index={index_str} buf={name}")
         else:
             # Direct indexing for contiguous access
@@ -2501,7 +2503,6 @@ class PallasKernel(SIMDKernel):
             return self._build_full_array_store_expr(out, value, needs_transpose)
 
         if needs_flatten:
-            from torch._inductor.exc import Unsupported
             raise Unsupported(f"Pallas: flatten store removed, index={index_str}")
 
         # Direct indexed assignment
@@ -2525,7 +2526,6 @@ class PallasKernel(SIMDKernel):
                 # For atomic_add, mark output as needing to be readable (for aliasing)
                 self.outputs_need_read.add(out)
                 alias_param = f"{out}_alias"
-                from torch._inductor.exc import Unsupported
                 raise Unsupported(f"Pallas: flatten indirect store removed, index={index_str}")
             else:
                 lines.append(f"{out}[{index_str}] = {value_expr}")
