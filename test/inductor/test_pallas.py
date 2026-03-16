@@ -720,6 +720,7 @@ class PallasTestsMixin:
         expected = fn(x, y)
         self.assertEqual(result, expected)
 
+    @skip_if_cpu(reason="scatter output blocks tiling")
     @skip_if_tpu
     @skip_if_cuda(reason="gather not supported in Pallas GPU (Mosaic) backend")
     def test_complex_indexing_gather(self):
@@ -1245,6 +1246,7 @@ class PallasTestsMixin:
         expected = fn(x, cos, sin)
         self.assertEqual(result, expected)
 
+    @skip_if_cpu(reason="strided slice blocks tiling")
     @skip_if_cuda
     @skip_if_tpu  # output last dim 10 not 128-aligned, Mosaic rejects it
     def test_chained_stride_slice(self):
@@ -1332,6 +1334,7 @@ class PallasTestsMixin:
         expected = fn(x)
         self.assertEqual(result, expected)
 
+    @skip_if_cpu(reason="arange in compute body blocks tiling")
     @skip_if_tpu
     @skip_if_cuda(reason="arange not supported in Pallas GPU (Mosaic) backend")
     def test_arange_multi_output(self):

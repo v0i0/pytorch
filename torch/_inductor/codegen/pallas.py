@@ -3417,9 +3417,10 @@ class PallasKernel(SIMDKernel):
         ctx.kernel_input_params = alias_params + ctx.pointer_tail
         ctx.full_kernel_params = alias_params + kernel_params
 
-        # Decide whether to use tiling for CPU/TPU after kernel body is fully
-        # generated (used_iter_vars is populated during load/store codegen).
-        self.tile_cpu_tpu = self._can_tile_cpu_tpu()
+        # Tiling is required for CPU/TPU — grid=(1,) fallback does not
+        # generalise to larger tensor sizes.
+        if not self.is_gpu and not self._can_tile_cpu_tpu():
+            raise Unsupported("Pallas: kernel cannot be tiled")
 
         extra_kernel_params = ""
         if self.tile_relative_iter_vars:
@@ -3496,41 +3497,14 @@ class PallasKernel(SIMDKernel):
                     "    for shape, dtype in zip(_pallas_out_shapes, out_dtypes)"
                 )
                 code.writeline(")")
-                if self.tile_cpu_tpu:
-                    self._codegen_tiled_specs(ctx)
+                if self.is_gpu:
+                    self._codegen_gpu_specs(ctx)
                 else:
-                    self._codegen_strided_reshapes(code, ctx.kernel_input_params)
-                    for param in ctx.kernel_input_params:
-                        buf_name = self._param_to_buf_name(param)
-                        cshape = (
-                            self.collapsed_reshape_inputs.get(buf_name)
-                            if buf_name
-                            else None
-                        )
-                        if cshape is not None:
-                            code.writeline(f"{param} = {param}.reshape({cshape})")
+                    self._codegen_tiled_specs(ctx)
 
-                    code.writeline("indexer = lambda n: lambda i: [jnp.int32(i)] * n")
-                    code.writeline("out_specs_pallas = tuple(")
-                    code.writeline("    pl.BlockSpec(shape, indexer(len(shape)))")
-                    code.writeline(
-                        "    for shape, dtype in zip(_pallas_out_shapes, out_dtypes)"
-                    )
-                    code.writeline(")")
-                    code.writeline("in_specs_pallas = tuple(")
-                    code.writeline("    pl.BlockSpec(i.shape, indexer(len(i.shape)))")
-                    code.writeline(
-                        "    for i in [" + ", ".join(ctx.kernel_input_params) + "]"
-                    )
-                    code.writeline(")")
-
-                if self.tile_relative_iter_vars:
-                    if self.tile_cpu_tpu:
-                        code.writeline("_pallas_tile = _tile")
-                        code.writeline("_pallas_ax2g = _ax2g")
-                    else:
-                        code.writeline("_pallas_tile = _pallas_out_shapes[0]")
-                        code.writeline("_pallas_ax2g = {}")
+                if self.tile_relative_iter_vars and not self.is_gpu:
+                    code.writeline("_pallas_tile = _tile")
+                    code.writeline("_pallas_ax2g = _ax2g")
 
                 # Wrap kernel with functools.partial to pass scalar arguments (size variables)
                 partial_args = []
@@ -4088,7 +4062,7 @@ from torch._inductor.runtime.runtime_utils import (
         alias_map_literal: str,
     ) -> None:
         code = ctx.code
-        grid_expr = "_grid" if self.tile_cpu_tpu else "(1,)"
+        grid_expr = "_grid"
         code.writeline("_result = pl.pallas_call(")
         code.writeline("    " + kernel_arg)
         code.writeline("    out_shape=out_shapes_pallas,")
