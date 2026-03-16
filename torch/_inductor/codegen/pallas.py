@@ -884,16 +884,11 @@ class PallasKernel(SIMDKernel):
         # Iteration vars that have been emitted in tile-relative form
         # (safe for tiling even when they appear in the compute body)
         self.tile_relative_iter_vars: OrderedSet[sympy.Symbol] = OrderedSet()
-        # Track if any load/store uses flatten-based indexing (buf[...].flatten()[idx])
-        self.has_flatten_indexing = False
         # Strided input buffers: map graph buffer name -> per-dim
         # (stride, offset, skip) triples.  Used to reshape inputs outside
         # the kernel and generate static indexing inside
         # (e.g. in_ref[:, :, offset] instead of in_ref[...].flatten()[idx]).
         self.strided_input_buffers: dict[str, list[tuple[int, int, int]]] = {}
-        # Buffers that already use flatten+gather indexing; strided
-        # decomposition must not reshape these (it would break flat offsets).
-        self.flatten_indexed_buffers: OrderedSet[str] = OrderedSet()
 
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
@@ -1106,11 +1101,6 @@ class PallasKernel(SIMDKernel):
         Returns None if decomposition fails.
         """
         if self._has_indirect_vars(index) or index.has(ModularIndexing):
-            return None
-
-        # Don't reshape a buffer that already has flatten+gather loads;
-        # the reshape would change the flat layout and break those loads.
-        if name in self.flatten_indexed_buffers:
             return None
 
         info = self._get_buffer_info(name)
@@ -1607,27 +1597,33 @@ class PallasKernel(SIMDKernel):
         groups.reverse()
         return groups
 
-    def _get_index_expr(self, index: sympy.Expr) -> tuple[str, bool]:
-        """Get the index expression string and whether it needs flattening."""
+    def _get_index_expr(self, index: sympy.Expr) -> str:
+        """Get the index expression string, raising Unsupported for known-bad cases."""
         has_indirect = self._has_indirect_vars(index)
         has_iter_vars = self._has_iteration_vars(index)
 
         if has_indirect and has_iter_vars:
-            return self._handle_mixed_indexing(index), True
-        elif has_indirect:
-            return self.kexpr(index), False
-        else:
-            index_str = self._get_index_str(index)
-            # Check if index contains ModularIndexing - this requires flattened access
-            # ModularIndexing is used for roll/wrap-around operations
-            needs_flatten = index.has(ModularIndexing) and index_str != "..."
-            # If index_str is an actual expression (not "..." or a slice pattern),
-            # we need flattened access because it uses block variables
-            if not needs_flatten and index_str != "...":
-                # Check if it's a simple slice pattern (::N or M::N)
-                if not ("::" in index_str or index_str.lstrip("-").isdigit()):
-                    needs_flatten = True
-            return index_str, needs_flatten
+            raise Unsupported(
+                f"Pallas: mixed indirect+iter indexing not supported, "
+                f"index={self._handle_mixed_indexing(index)}"
+            )
+        if has_indirect:
+            return self.kexpr(index)
+        if index.has(ModularIndexing):
+            raise Unsupported(
+                f"Pallas: ModularIndexing not supported, "
+                f"index={self._get_index_str(index)}"
+            )
+        return self._get_index_str(index)
+
+    def _is_direct_index(self, index: sympy.Expr, index_str: str) -> bool:
+        """Check if index_str can be used directly (no further rewriting needed)."""
+        if index_str == "..." or "::" in index_str or index_str.lstrip("-").isdigit():
+            return True
+        # Indirect variable expressions are valid JAX indexing
+        if self._has_indirect_vars(index):
+            return True
+        return False
 
     @staticmethod
     def _safe_int(val: Any) -> int | None:
@@ -1966,8 +1962,7 @@ class PallasKernel(SIMDKernel):
         name: str,
         index: sympy.Expr,
         index_str: str,
-        needs_flatten: bool,
-    ) -> tuple[str, bool]:
+    ) -> str:
         """
         Check if buffer access needs strided indexing due to size mismatch or gather patterns.
 
@@ -1977,12 +1972,12 @@ class PallasKernel(SIMDKernel):
         - Transposed or strided buffer access
         """
         # Only applies when full array access is indicated
-        if index_str != "..." or needs_flatten:
-            return index_str, needs_flatten
+        if index_str != "...":
+            return index_str
 
         info = self._get_buffer_info(name)
         if info is None:
-            return index_str, needs_flatten
+            return index_str
 
         buf_obj, buf_size, buf_numel, actual_strides, is_contiguous = info
         output_numel, used_vars = self._compute_output_numel_from_index(index)
@@ -2021,77 +2016,92 @@ class PallasKernel(SIMDKernel):
             and not skip_for_non_contiguous
             and not has_symbolic_coef
         ):
-            return self._generate_strided_index(index), True
+            strided = self._generate_strided_index(index)
+            slice_str = self._try_multidim_slice(name, index, strided)
+            if slice_str is not None:
+                return slice_str
+            raise Unsupported(
+                f"Pallas: strided indexing not supported, index={strided}"
+            )
 
-        return index_str, needs_flatten
+        return index_str
 
     def _adjust_index_for_buffer_shape(
         self,
         name: str,
         index: sympy.Expr,
         index_str: str,
-        needs_flatten: bool,
-    ) -> tuple[str, bool]:
+    ) -> str:
         """
         Adjust index expression based on buffer shape (0-dim scalar, multi-dim, etc.).
         """
-        if needs_flatten or index_str == "...":
-            return index_str, needs_flatten
+        if index_str == "...":
+            return index_str
 
         buf_obj = V.graph.get_buffer(name)
         if buf_obj is None:
-            return index_str, needs_flatten
+            return index_str
 
         buf_size = buf_obj.get_size()
 
         # 0-dimensional (scalar) buffer - use [...] to access it
         if len(buf_size) == 0:
-            return "...", needs_flatten
+            return "..."
 
         # Multi-dimensional buffer with constant/scalar index
         if len(buf_size) > 1:
             has_iter_vars = self._has_iteration_vars(index)
             if not has_iter_vars:
-                return index_str, True  # Use flattened access
-            elif "::" in index_str:
-                # Strided slice patterns need flattened indexing for multi-dim
-                return self._generate_strided_index(index), True
+                raise Unsupported(
+                    f"Pallas: multi-dim constant index not supported, index={index_str}"
+                )
+            if "::" in index_str:
+                strided = self._generate_strided_index(index)
+                slice_str = self._try_multidim_slice(name, index, strided)
+                if slice_str is not None:
+                    return slice_str
+                raise Unsupported(
+                    f"Pallas: strided multi-dim index not supported, index={strided}"
+                )
 
         # GPU doesn't support gather from slice patterns on 1D buffers
         if self.is_gpu and "::" in index_str:
-            return self._generate_strided_index(index), True
+            strided = self._generate_strided_index(index)
+            slice_str = self._try_multidim_slice(name, index, strided)
+            if slice_str is not None:
+                return slice_str
+            raise Unsupported(
+                f"Pallas: GPU strided index not supported, index={strided}"
+            )
 
-        return index_str, needs_flatten
+        return index_str
 
     def _try_multidim_slice(
         self,
         name: str,
         index: sympy.Expr,
         index_str: str,
-        needs_flatten: bool,
-    ) -> tuple[str, bool]:
+    ) -> str | None:
         """
-        Try to emit multi-dim slice notation instead of flatten + gather.
+        Try to emit multi-dim slice notation instead of a flat strided index.
 
         For a buffer with shape (d0, ..., dk) and index `stride * var + offset`,
         emit `buf[:, ..., :, offset::stride]` when stride divides dk.
+        Returns the slice string on success, None on failure.
         """
-        if not needs_flatten:
-            return index_str, needs_flatten
-
         buf_obj = V.graph.get_buffer(name)
         if buf_obj is None:
-            return index_str, needs_flatten
+            return None
 
         buf_size = buf_obj.get_size()
         ndim = len(buf_size)
         if ndim < 2:
-            return index_str, needs_flatten
+            return None
 
         # Need a single iteration variable with an affine index
         used_vars = self._get_used_iter_vars(index)
         if len(used_vars) != 1:
-            return index_str, needs_flatten
+            return None
 
         var = next(iter(used_vars))
         var_expr = BlockPatternMatcher.get_subexpr_involving_symbol(index, var)
@@ -2099,44 +2109,42 @@ class PallasKernel(SIMDKernel):
             BlockPatternMatcher.match_affine_block_expr(var_expr, var)
         )
         if stride is None or stride <= 1:
-            return index_str, needs_flatten
+            return None
 
         offset = V.graph.sizevars.simplify(index - var_expr)
         try:
             offset_val = int(offset)
         except (TypeError, ValueError):
-            return index_str, needs_flatten
+            return None
 
         if offset_val < 0 or offset_val >= stride:
-            return index_str, needs_flatten
+            return None
 
         last_dim = self._safe_int(buf_size[-1])
         if last_dim is None or last_dim % stride != 0:
-            return index_str, needs_flatten
+            return None
 
         # Verify the iteration variable covers all buffer elements at the
-        # given stride: var_length * stride == buf_numel. This ensures
+        # given stride: var_length * stride == buf_numel.  This ensures
         # the flattened stride-access 0, stride, 2*stride, ... maps exactly
         # to buf[:, ..., :, offset::stride].
         entry = self.range_tree_nodes.get(var)
         if entry is None:
-            return index_str, needs_flatten
+            return None
         var_length = self._safe_int(entry.length)
         buf_numel = 1
         for s in buf_size:
             d = self._safe_int(s)
             if d is None:
-                return index_str, needs_flatten
+                return None
             buf_numel *= d
         if var_length is None or var_length * stride != buf_numel:
-            return index_str, needs_flatten
+            return None
 
         prefix = ":, " * (ndim - 1)
         if offset_val == 0:
-            slice_str = f"{prefix}::{stride}"
-        else:
-            slice_str = f"{prefix}{offset_val}::{stride}"
-        return slice_str, False
+            return f"{prefix}::{stride}"
+        return f"{prefix}{offset_val}::{stride}"
 
     @staticmethod
     def _gather_permute_expr(load_expr: str, perm: tuple[int, ...]) -> str:
@@ -2154,36 +2162,28 @@ class PallasKernel(SIMDKernel):
         name: str,
         index: sympy.Expr,
         index_str: str,
-        needs_flatten: bool,
     ) -> str:
         """
         Build the load expression based on indexing mode.
         """
-        if needs_flatten:
-            from torch._inductor.exc import Unsupported
-            raise Unsupported(f"Pallas: flatten load removed, index={index_str} buf={name}")
-        else:
-            # Direct indexing for contiguous access
-            load_expr = f"{buf}[{index_str}]"
+        load_expr = f"{buf}[{index_str}]"
 
-            if index_str == "..." and not self.is_gpu:
-                perm = self._get_full_load_permutation(name, index)
-                if perm is not None:
-                    load_expr = self._gather_permute_expr(load_expr, perm)
-                    self.permuted_input_buffers[name] = perm
-                else:
-                    collapsed = self._get_collapsed_load_permutation(name, index)
-                    if collapsed is not None:
-                        collapsed_shape, cperm = collapsed
-                        load_expr = f"jnp.permute_dims({load_expr}, {cperm})"
-                        # Don't store cperm in permuted_input_buffers as it's for the reshaped tensor
-                        # not the original shape, which causes issues later when used for tiling
-                        self.collapsed_reshape_inputs[name] = collapsed_shape
-                        self.collapsed_output_shape = tuple(
-                            collapsed_shape[p] for p in cperm
-                        )
+        if index_str == "..." and not self.is_gpu:
+            perm = self._get_full_load_permutation(name, index)
+            if perm is not None:
+                load_expr = self._gather_permute_expr(load_expr, perm)
+                self.permuted_input_buffers[name] = perm
+            else:
+                collapsed = self._get_collapsed_load_permutation(name, index)
+                if collapsed is not None:
+                    collapsed_shape, cperm = collapsed
+                    load_expr = f"jnp.permute_dims({load_expr}, {cperm})"
+                    self.collapsed_reshape_inputs[name] = collapsed_shape
+                    self.collapsed_output_shape = tuple(
+                        collapsed_shape[p] for p in cperm
+                    )
 
-            return load_expr
+        return load_expr
 
     def _maybe_squeeze_intermediate_buffer(self, name: str, load_expr: str) -> str:
         """
@@ -2303,16 +2303,16 @@ class PallasKernel(SIMDKernel):
         return f"{load_expr}.reshape({', '.join(map(str, reshape_dims))})"
 
     def _check_im2col_pattern(
-        self, index: sympy.Expr, index_str: str, needs_flatten: bool
-    ) -> tuple[str, bool]:
+        self, index: sympy.Expr, index_str: str
+    ) -> str:
         """
         Check for im2col-like patterns where store uses block variables but load doesn't.
 
         For cat/expand patterns, both load and store prepared indices share block vars.
         For im2col patterns, store compresses to block vars but load doesn't.
         """
-        if index_str != "..." or needs_flatten:
-            return index_str, needs_flatten
+        if index_str != "...":
+            return index_str
 
         prepared_index = self.prepare_indexing(index)
         iter_vars = self._get_iter_vars()
@@ -2326,20 +2326,16 @@ class PallasKernel(SIMDKernel):
 
         # Only trigger if store introduces new block vars
         if not new_vars or len(store_orig_vars) <= 1:
-            return index_str, needs_flatten
+            return index_str
 
         # Check if loads are compatible with broadcast or cat pattern
-        has_im2col_pattern = False
         for buf_name, load_index in self.load_index_exprs.items():
             load_orig_vars = self._get_used_iter_vars(load_index)
             if not load_orig_vars:
                 continue
-
-            # Load has iteration variables
             if load_orig_vars != store_orig_vars:
                 continue
 
-            # Same vars - check if load gets compressed too
             prep_load = self.prepare_indexing(load_index)
             load_prep_vars = (
                 prep_load.free_symbols
@@ -2347,21 +2343,18 @@ class PallasKernel(SIMDKernel):
                 else OrderedSet()
             ) & iter_vars
 
-            # If store compresses but load doesn't, check for strided input vs im2col
             if load_orig_vars != load_prep_vars or store_prep_vars == store_orig_vars:
                 continue
 
-            # Check if load coefficients match buffer strides
             if not self._check_load_is_strided_input(
                 buf_name, load_index, load_orig_vars
             ):
-                has_im2col_pattern = True
-                break
+                raise Unsupported(
+                    f"Pallas: im2col pattern not supported, "
+                    f"index={self._generate_strided_index(prepared_index)}"
+                )
 
-        if has_im2col_pattern:
-            return self._generate_strided_index(prepared_index), True
-
-        return index_str, needs_flatten
+        return index_str
 
     def _check_load_is_strided_input(
         self, buf_name: str, load_index: sympy.Expr, load_orig_vars: OrderedSet
@@ -2487,7 +2480,6 @@ class PallasKernel(SIMDKernel):
         index: sympy.Expr,
         value: CSEVariable,
         index_str: str,
-        needs_flatten: bool,
         mode: Any = None,
     ) -> list[str]:
         """
@@ -2496,39 +2488,27 @@ class PallasKernel(SIMDKernel):
         Returns a list of lines to emit.
         """
         if index_str == "...":
-            # Full array store with shape matching
             needs_transpose = self._check_store_needs_transpose(name)
             return self._build_full_array_store_expr(out, value, needs_transpose)
 
-        if needs_flatten:
-            from torch._inductor.exc import Unsupported
-            raise Unsupported(f"Pallas: flatten store removed, index={index_str}")
-
-        # Direct indexed assignment
         has_indirect = self._has_indirect_vars(index)
         buf = V.graph.get_buffer(name)
 
         if buf is not None:
             buf_size = buf.get_size()
             if len(buf_size) > 1 and not self._has_iteration_vars(index):
-                # Multi-dim output with constant index - use [...] for full assignment
                 return self._build_full_array_store_expr(out, value, False)
 
         if has_indirect:
-            # Indirect indexed store (scatter): use .add() for atomic_add, .set() otherwise
-            scatter_op = "add" if mode == "atomic_add" else "set"
+            if mode == "atomic_add":
+                raise Unsupported(
+                    f"Pallas: indirect atomic_add store not supported, index={index_str}"
+                )
             lines = [f"_val = jnp.asarray({value})"]
             value_expr = (
                 f"(jnp.full({index_str}.shape, _val) if _val.ndim == 0 else {value})"
             )
-            if mode == "atomic_add":
-                # For atomic_add, mark output as needing to be readable (for aliasing)
-                self.outputs_need_read.add(out)
-                alias_param = f"{out}_alias"
-                from torch._inductor.exc import Unsupported
-                raise Unsupported(f"Pallas: flatten indirect store removed, index={index_str}")
-            else:
-                lines.append(f"{out}[{index_str}] = {value_expr}")
+            lines.append(f"{out}[{index_str}] = {value_expr}")
             return lines
 
         return [f"{out}[{index_str}] = {value}"]
@@ -2621,41 +2601,30 @@ class PallasKernel(SIMDKernel):
         # Track the load index expression for argmax/argmin axis detection
         self.load_index_exprs[name] = index
 
-        # Get base index expression
-        index_str, needs_flatten = self._get_index_expr(index)
-
-        # Check for buffer size mismatch requiring strided indexing
-        index_str, needs_flatten = self._needs_strided_indexing(
-            name, index, index_str, needs_flatten
-        )
-
-        # Try strided decomposition before multidim slice or flatten.
-        # This generates reshape + static indexing which works on both
-        # CPU and TPU (unlike slice notation which fails on Mosaic).
+        # Try strided decomposition first — generates reshape + static
+        # indexing which works on both CPU and TPU.
         decomp = self._decompose_strided_access(index, name)
         if decomp is not None:
             self.strided_input_buffers[name] = decomp
             load_expr = self._strided_load_expr(buf, decomp)
+            index_str = "..."
         else:
-            # Adjust index for buffer shape (scalar, multi-dim, etc.)
-            index_str, needs_flatten = self._adjust_index_for_buffer_shape(
-                name, index, index_str, needs_flatten
+            index_str = self._get_index_expr(index)
+            index_str = self._needs_strided_indexing(name, index, index_str)
+            index_str = self._adjust_index_for_buffer_shape(
+                name, index, index_str
             )
+            if not self._is_direct_index(index, index_str):
+                slice_str = self._try_multidim_slice(name, index, index_str)
+                if slice_str is None:
+                    raise Unsupported(
+                        f"Pallas: unsupported index expression, index={index_str}"
+                    )
+                index_str = slice_str
+            load_expr = self._build_load_expr(buf, name, index, index_str)
 
-            # Try to emit multi-dim slice instead of flatten + gather
-            index_str, needs_flatten = self._try_multidim_slice(
-                name, index, index_str, needs_flatten
-            )
-
-            # Build the load expression
-            load_expr = self._build_load_expr(
-                buf, name, index, index_str, needs_flatten
-            )
-
-        # Handle intermediate buffer squeezing for correct broadcasting
-        if not needs_flatten and index_str == "...":
+        if index_str == "...":
             load_expr = self._maybe_squeeze_intermediate_buffer(name, load_expr)
-            # Handle 1D buffer broadcasting for higher-dimensional kernels
             load_expr = self._maybe_broadcast_1d_buffer(name, index, load_expr)
 
         return self.cse.generate(
@@ -2898,17 +2867,10 @@ class PallasKernel(SIMDKernel):
                         )
                     ]
                 else:
-                    # Get base index expression
-                    index_str, needs_flatten = self._get_index_expr(index)
-
-                    # Check for im2col-like patterns
-                    index_str, needs_flatten = self._check_im2col_pattern(
-                        index, index_str, needs_flatten
-                    )
-
-                    # Build the store expression
+                    index_str = self._get_index_expr(index)
+                    index_str = self._check_im2col_pattern(index, index_str)
                     store_lines = self._build_store_expr(
-                        out, name, index, value, index_str, needs_flatten, mode
+                        out, name, index, value, index_str, mode
                     )
 
         for line in store_lines:
@@ -3155,12 +3117,9 @@ class PallasKernel(SIMDKernel):
 
         Reject:
         - GPU (has its own TMA / padding path)
-        - Flatten-based indexing
         - Scatter outputs (indirect indexing complicates tile boundaries)
         """
         if self.is_gpu:
-            return False
-        if self.has_flatten_indexing:
             return False
         if self.outputs_need_read:
             return False
@@ -3808,7 +3767,6 @@ from torch._inductor.runtime.runtime_utils import (
                     var_in_compute
                     and not self.is_gpu
                     and not self.outputs_need_read
-                    and not self.has_flatten_indexing
                     and not entry.is_reduction
                 )
                 axis_idx = (
